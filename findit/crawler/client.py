@@ -28,10 +28,22 @@ SEARCH_KEYWORDS = [
     "相亲", "CPDD", "征男友", "找另一半", "单身交友",
 ]
 
-# Keywords that signal dating intent in comments
+# Keywords/phrases that signal dating intent in comments.
+# Using longer phrases instead of single characters like "找" or "求"
+# to reduce false positives from non-dating comments.
 COMMENT_DATING_KEYWORDS = [
-    "蹲", "求", "找", "交友", "同城", "脱单", "单身",
-    "求认识", "坐标", "互相了解", "私聊", "dd",
+    # Explicit dating-seeking phrases
+    "蹲一个", "蹲男友", "蹲对象", "蹲男朋友", "蹲女友", "蹲女朋友",
+    "找对象", "找男友", "找男朋友", "找女友", "找女朋友", "找另一半",
+    "求脱单", "求认识", "求交友",
+    # Status keywords (still specific enough)
+    "单身", "脱单", "交友", "同城",
+    # Self-intro style comments
+    "坐标", "互相了解",
+    # Code words / abbreviations
+    "私聊", "dd", "cpdd", "CPDD",
+    # Condition-listing comments (people posting their stats)
+    "身高1", "本科", "硕士", "研究生",
 ]
 
 _BASE_HEADERS = {

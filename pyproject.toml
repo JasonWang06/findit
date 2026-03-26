@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 findit-crawl = "findit.crawler.runner:main"
+findit-crawler-service = "findit.services.crawler_service:main"
 findit-bot = "findit.bot.app:main"
 findit-pipeline = "findit.pipeline:main"
 

@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     crawl_request_delay_min: float = 2.0
     crawl_request_delay_max: float = 5.0
 
+    # Crawler service
+    crawler_continuous: bool = True  # True = run_forever, False = run_once
+
     # Recommendation
     daily_match_count: int = 5
     high_match_count: int = 3

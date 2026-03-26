@@ -1,12 +1,11 @@
 """Main pipeline orchestrator.
 
-Runs the full data pipeline:
-1. Crawl new data from Xiaohongshu
-2. Apply rule-based filters
-3. Run AI scoring for all registered users
-4. Generate matches and openers
+Runs the full data pipeline in two phases:
+1. Crawler service: crawl + shared filtering (user-independent)
+2. Matching service: per-user scoring + match generation
 
-Can be run as a one-shot CLI command or scheduled via cron/APScheduler.
+Can be run as a one-shot CLI command or scheduled via cron.
+For continuous crawling, use `findit-crawler-service` instead.
 """
 
 from __future__ import annotations
@@ -15,49 +14,33 @@ import asyncio
 import logging
 
 from findit.config import settings
-from findit.crawler.runner import CrawlRunner
 from findit.db import Database
-from findit.recommender import RecommendationEngine
+from findit.services.crawler_service import CrawlerService
+from findit.services.matching_service import MatchingService
 
 logger = logging.getLogger(__name__)
 
 
 async def run_pipeline() -> dict:
-    """Execute the full pipeline."""
+    """Execute the full pipeline: crawl → filter → match."""
     db = Database(settings.db_path)
 
-    # Step 1: Crawl
-    logger.info("=== Step 1: Crawling ===")
-    crawler = CrawlRunner(db=db)
-    crawl_result = await crawler.run_full_pipeline()
-    logger.info("Crawl results: %s", crawl_result)
+    # Phase 1: Crawl + shared filtering
+    logger.info("=== Phase 1: Crawling + Shared Filtering ===")
+    crawler_service = CrawlerService(db=db)
+    crawl_result = await crawler_service.run_once()
+    logger.info("Crawl + filter results: %s", crawl_result)
 
-    # Step 2-3: Filter + Score for each user
-    logger.info("=== Step 2-3: Filtering and Scoring ===")
-    engine = RecommendationEngine(db=db)
+    # Phase 2: Per-user matching
+    logger.info("=== Phase 2: Per-User Matching ===")
+    matching_service = MatchingService(db=db)
+    match_results = matching_service.process_all_users()
+    logger.info("Match results: %s", match_results)
 
-    with db._conn() as conn:
-        users = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT * FROM users WHERE setup_complete = 1"
-            ).fetchall()
-        ]
-
-    match_counts = {}
-    for user in users:
-        logger.info("Processing user: %s", user.get("telegram_id"))
-        matches = engine.process_pipeline_for_user(user)
-        match_counts[user["telegram_id"]] = len(matches)
-        logger.info("Generated %d matches for user %s", len(matches), user["telegram_id"])
-
-    result = {
+    return {
         "crawl": crawl_result,
-        "users_processed": len(users),
-        "matches": match_counts,
+        "matches": match_results,
     }
-    logger.info("Pipeline complete: %s", result)
-    return result
 
 
 def main() -> None:

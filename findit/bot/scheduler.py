@@ -1,4 +1,8 @@
-"""Scheduled jobs for the Telegram bot (daily match push)."""
+"""Scheduled jobs for the Telegram bot (daily match push).
+
+Only triggers the matching service (per-user scoring from the shared pool).
+The crawler runs as a separate service and is NOT triggered here.
+"""
 
 from __future__ import annotations
 
@@ -8,16 +12,21 @@ from datetime import time
 from telegram.ext import Application
 
 from findit.bot import messages as msg
-from findit.bot.handlers import _format_match_card, _match_keyboard, _get_db, _get_engine
+from findit.bot.handlers import _format_match_card, _match_keyboard, _get_db
 from findit.config import settings
+from findit.services.matching_service import MatchingService
 
 logger = logging.getLogger(__name__)
 
 
 async def _daily_push_job(context) -> None:
-    """Push daily matches to all active users."""
+    """Push daily matches to all active users.
+
+    Uses the matching service to generate matches from the shared pool.
+    Does NOT trigger crawling — the crawler service runs separately.
+    """
     db = _get_db()
-    engine = _get_engine()
+    matching = MatchingService(db=db)
 
     with db._conn() as conn:
         rows = conn.execute(
@@ -29,7 +38,7 @@ async def _daily_push_job(context) -> None:
 
     for user in users:
         try:
-            matches = engine.process_pipeline_for_user(user)
+            matches = matching.generate_matches(user)
             telegram_id = int(user["telegram_id"])
 
             if not matches:
@@ -39,7 +48,6 @@ async def _daily_push_job(context) -> None:
                 )
                 continue
 
-            # Send header
             await context.bot.send_message(
                 chat_id=telegram_id,
                 text=f"🌟 今日为你精选了 {len(matches)} 个匹配！",

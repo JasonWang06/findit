@@ -104,6 +104,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     @contextmanager
@@ -237,6 +238,53 @@ class Database:
                 (limit,),
             ).fetchall()
             return [r["author_id"] for r in rows]
+
+    def get_unfiltered_authors(self, limit: int = 100) -> list[dict]:
+        """Get authors that haven't been through shared filtering yet.
+
+        Used by the crawler service to run shared filters on new authors.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM authors
+                   WHERE is_filtered_out = 0 AND is_real_person IS NULL
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_screened_candidates(
+        self, city: str | None = None, limit: int = 200
+    ) -> list[dict]:
+        """Get authors that passed shared filtering, optionally by city.
+
+        Used by the matching service to get candidates for per-user scoring.
+        Returns authors joined with their posts.
+        """
+        with self._conn() as conn:
+            query = """SELECT p.*, a.nickname, a.ip_location, a.bio, a.age_tag,
+                       a.is_real_person, a.notes_summary, a.followers, a.avatar_url
+                       FROM posts p
+                       JOIN authors a ON p.author_id = a.id
+                       WHERE a.is_filtered_out = 0
+                       AND a.is_real_person IS NOT NULL"""
+            params: list[Any] = []
+            if city:
+                query += " AND a.ip_location LIKE ?"
+                params.append(f"%{city}%")
+            query += " ORDER BY p.crawled_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_author_posts(self, author_id: str) -> list[dict]:
+        """Get all posts by an author (for inactive check)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM posts WHERE author_id = ? ORDER BY created_at DESC",
+                (author_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     # ── Users ───────────────────────────────────────────────────────────
 

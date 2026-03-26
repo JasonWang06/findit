@@ -13,7 +13,7 @@ from findit.ai.opener import OpenerGenerator
 from findit.bot import messages as msg
 from findit.config import settings
 from findit.db import Database
-from findit.recommender import RecommendationEngine
+from findit.services.matching_service import MatchingService
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,8 @@ def _get_db() -> Database:
     return Database(settings.db_path)
 
 
-def _get_engine() -> RecommendationEngine:
-    return RecommendationEngine(_get_db())
+def _get_matching_service() -> MatchingService:
+    return MatchingService(_get_db())
 
 
 # ── Command handlers ────────────────────────────────────────────────────
@@ -76,8 +76,8 @@ async def cmd_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔍 正在为你寻找匹配，请稍候...")
 
     try:
-        engine = _get_engine()
-        matches = engine.get_daily_matches(user["id"])
+        matching = _get_matching_service()
+        matches = matching.generate_matches(user)
 
         if not matches:
             await update.message.reply_text(msg.NO_MATCHES)
