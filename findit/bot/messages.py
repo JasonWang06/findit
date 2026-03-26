@@ -51,7 +51,7 @@ MATCH_CARD = (
     "👤 {nickname}\n"
     "📍 {location} · {age_tag}\n"
     "📝 {bio_short}\n\n"
-    "📊 匹配度：{match_score}%\n"
+    "📊 匹配度：{match_score}\n"
     "💡 {match_analysis}\n\n"
     "💬 推荐话术：\n"
     "```\n{opener}\n```\n\n"
@@ -89,6 +89,8 @@ PREFERENCES_PROMPT = (
 )
 
 PREFERENCES_SAVED = "✅ 偏好已保存！"
+
+AI_NOT_ENABLED = "⚠️ AI话术功能未启用（需要配置 ANTHROPIC_API_KEY）。"
 
 ERROR_NOT_SETUP = "⚠️ 请先完善资料！发送 /setup 开始。"
 ERROR_GENERIC = "⚠️ 出了点问题，请稍后再试。"

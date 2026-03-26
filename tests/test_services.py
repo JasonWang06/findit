@@ -2,7 +2,7 @@
 
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from findit.db import Database
 from findit.services.crawler_service import CrawlerService
@@ -174,3 +174,101 @@ class TestDBNewMethods:
 
         posts = db.get_author_posts("a1")
         assert len(posts) == 2
+
+
+class TestMatchingServiceNoAPI:
+    """Test matching service when ANTHROPIC_API_KEY is not configured."""
+
+    def test_init_without_api_key(self):
+        """MatchingService should initialize without API key."""
+        db = _make_db()
+        with patch("findit.services.matching_service.settings") as mock_settings:
+            mock_settings.anthropic_api_key = ""
+            mock_settings.daily_match_count = 5
+            mock_settings.high_match_count = 3
+            mock_settings.db_path = db.db_path
+            service = MatchingService(db=db)
+            assert service._api_enabled is False
+            assert service.scorer is None
+            assert service.opener_gen is None
+
+    def test_create_matches_simple_no_api(self):
+        """Without API, matches should be created without scores/openers."""
+        db = _make_db()
+        db.upsert_author({
+            "id": "a1", "nickname": "Girl", "bio": "爱生活",
+            "ip_location": "深圳",
+        })
+        db.update_author_scores("a1", is_real_person=0.5)
+        db.upsert_post({
+            "id": "p1", "author_id": "a1",
+            "content": "找男友", "source_type": "post",
+        })
+        user = db.get_or_create_user("tg_noapi")
+        db.update_user("tg_noapi", setup_complete=1, city="深圳")
+        user = db.get_user_by_telegram("tg_noapi")
+
+        with patch("findit.services.matching_service.settings") as mock_settings:
+            mock_settings.anthropic_api_key = ""
+            mock_settings.daily_match_count = 5
+            mock_settings.high_match_count = 3
+            mock_settings.db_path = db.db_path
+            service = MatchingService(db=db)
+            matches = service.generate_matches(user)
+
+        assert len(matches) == 1
+        assert matches[0]["match_score"] is None
+        assert matches[0]["generated_opener"] is None
+
+    def test_select_unscored_matches_by_recency(self):
+        """Without API, matches should be ordered by crawl time."""
+        db = _make_db()
+        db.upsert_author({"id": "a1", "nickname": "Girl1", "bio": "hi"})
+        db.upsert_author({"id": "a2", "nickname": "Girl2", "bio": "hi"})
+        db.upsert_post({
+            "id": "p1", "author_id": "a1",
+            "content": "找男友", "source_type": "post",
+            "crawled_at": "2026-01-01T00:00:00",
+        })
+        db.upsert_post({
+            "id": "p2", "author_id": "a2",
+            "content": "找对象", "source_type": "post",
+            "crawled_at": "2026-03-01T00:00:00",
+        })
+        user = db.get_or_create_user("tg_order")
+
+        # Create matches without scores
+        db.create_match({
+            "user_id": user["id"], "post_id": "p1", "author_id": "a1",
+            "match_score": None, "generated_opener": None,
+        })
+        db.create_match({
+            "user_id": user["id"], "post_id": "p2", "author_id": "a2",
+            "match_score": None, "generated_opener": None,
+        })
+
+        with patch("findit.services.matching_service.settings") as mock_settings:
+            mock_settings.anthropic_api_key = ""
+            mock_settings.daily_match_count = 5
+            mock_settings.high_match_count = 3
+            mock_settings.db_path = db.db_path
+            service = MatchingService(db=db)
+            matches = service._select_daily_matches(user["id"])
+
+        assert len(matches) == 2
+        # Most recent first
+        assert matches[0]["post_id"] == "p2"
+        assert matches[1]["post_id"] == "p1"
+
+    def test_init_with_api_key(self):
+        """MatchingService with API key should have scorer and opener_gen."""
+        db = _make_db()
+        with patch("findit.services.matching_service.settings") as mock_settings:
+            mock_settings.anthropic_api_key = "sk-test-key"
+            mock_settings.daily_match_count = 5
+            mock_settings.high_match_count = 3
+            mock_settings.db_path = db.db_path
+            service = MatchingService(db=db)
+            assert service._api_enabled is True
+            assert service.scorer is not None
+            assert service.opener_gen is not None

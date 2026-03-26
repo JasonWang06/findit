@@ -17,6 +17,8 @@ from findit.services.matching_service import MatchingService
 
 logger = logging.getLogger(__name__)
 
+_api_enabled = bool(settings.anthropic_api_key)
+
 # Setup flow step definitions
 SETUP_STEPS = [
     ("age", msg.SETUP_AGE),
@@ -294,6 +296,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif data.startswith("regen_"):
         match_id = int(data.split("_")[1])
+
+        if not _api_enabled:
+            await query.message.reply_text(msg.AI_NOT_ENABLED)
+            return
+
         await query.message.reply_text(msg.ACTION_REGENERATE)
 
         match = db.get_match_by_id(match_id)
@@ -328,8 +335,17 @@ def _format_match_card(match: dict, index: int, total: int) -> str:
     if len(bio) > 60:
         bio = bio[:57] + "..."
 
-    opener = match.get("generated_opener") or "暂无话术"
     post_url = match.get("post_url") or "#"
+    has_score = match.get("match_score") is not None
+
+    if has_score:
+        score_text = f"{int(match['match_score'])}%"
+        analysis_text = match.get("match_analysis") or ""
+        opener = match.get("generated_opener") or "暂无话术"
+    else:
+        score_text = "未评分"
+        analysis_text = "AI评分未启用"
+        opener = "AI话术未启用，请查看原帖自行破冰"
 
     return (
         msg.MATCH_HEADER.format(index=index, total=total)
@@ -338,8 +354,8 @@ def _format_match_card(match: dict, index: int, total: int) -> str:
             location=match.get("ip_location") or "未知",
             age_tag=match.get("age_tag") or "",
             bio_short=bio,
-            match_score=int(match.get("match_score") or 0),
-            match_analysis=match.get("match_analysis") or "",
+            match_score=score_text,
+            match_analysis=analysis_text,
             opener=opener,
             post_url=post_url,
         )
@@ -348,10 +364,12 @@ def _format_match_card(match: dict, index: int, total: int) -> str:
 
 def _match_keyboard(match_id: int) -> InlineKeyboardMarkup:
     """Build inline keyboard for a match card."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👍 感兴趣", callback_data=f"like_{match_id}"),
-            InlineKeyboardButton("👎 不感兴趣", callback_data=f"pass_{match_id}"),
-            InlineKeyboardButton("🔄 换话术", callback_data=f"regen_{match_id}"),
-        ]
-    ])
+    buttons = [
+        InlineKeyboardButton("👍 感兴趣", callback_data=f"like_{match_id}"),
+        InlineKeyboardButton("👎 不感兴趣", callback_data=f"pass_{match_id}"),
+    ]
+    if _api_enabled:
+        buttons.append(
+            InlineKeyboardButton("🔄 换话术", callback_data=f"regen_{match_id}")
+        )
+    return InlineKeyboardMarkup([buttons])
