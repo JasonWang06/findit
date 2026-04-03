@@ -40,6 +40,7 @@ echo "[4/5] 安装 Python 依赖..."
 python3 -m venv venv
 source venv/bin/activate
 pip install -e . --quiet
+playwright install chromium --with-deps
 
 # 5. 创建 .env 配置文件（如果不存在）
 if [ ! -f "$PROJECT_DIR/.env" ]; then
