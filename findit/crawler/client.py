@@ -1,8 +1,9 @@
-"""Xiaohongshu API client using the xhs library for proper request signing.
+"""Xiaohongshu API client using the xhs library with Playwright-based signing.
 
-Uses the xhs library (ReaJason/xhs) which handles XHS's complex
-request signing (X-s, X-t, X-s-common headers) via its built-in
-signing algorithm. Cookie-based authentication is still required.
+Uses the xhs library (ReaJason/xhs) for API methods, but replaces its
+outdated pure-Python signing with real browser-based signing via Playwright.
+This calls window._webmsxyw() in a headless Chromium to generate valid
+x-s, x-t, x-s-common headers that pass XHS's server-side verification.
 """
 
 from __future__ import annotations
@@ -13,9 +14,9 @@ import random
 from typing import Any
 
 from xhs import XhsClient as _XhsClient
-from xhs.help import sign as xhs_sign
 
 from findit.config import settings
+from findit.crawler.sign import PlaywrightSigner
 
 logger = logging.getLogger(__name__)
 
@@ -44,21 +45,15 @@ COMMENT_DATING_KEYWORDS = [
 ]
 
 
-def _sign_wrapper(uri: str, data=None, a1="", web_session=""):
-    """Sign function adapter for the xhs library.
-
-    The xhs library's XhsClient expects an external_sign function that
-    returns a dict with x-s, x-t, and x-s-common headers.
-    We use the library's own built-in sign() function for this.
-    """
-    return xhs_sign(uri, data, a1=a1)
-
-
 class XHSClient:
     """Async wrapper around the xhs library's XhsClient.
 
+    Uses Playwright-based signing for valid request headers.
     The xhs library is synchronous, so all API calls are wrapped
     with asyncio.to_thread() to avoid blocking the event loop.
+
+    Must call ``await client.setup()`` before use and
+    ``await client.close()`` when done.
     """
 
     WEB_URL = "https://www.xiaohongshu.com"
@@ -67,10 +62,28 @@ class XHSClient:
         self.cookie = cookie or settings.xhs_cookie
         self._delay_min = settings.crawl_request_delay_min
         self._delay_max = settings.crawl_request_delay_max
+        self._signer = PlaywrightSigner(cookie=self.cookie)
+        self._client: _XhsClient | None = None
+
+    async def setup(self) -> None:
+        """Start the Playwright browser and initialize the xhs client.
+
+        Must be called once before making any API requests.
+        """
+        await self._signer.start()
         self._client = _XhsClient(
             cookie=self.cookie,
-            sign=_sign_wrapper,
+            sign=self._signer.sign_sync,
         )
+
+    async def close(self) -> None:
+        """Shut down the Playwright browser."""
+        await self._signer.close()
+
+    def _ensure_client(self) -> _XhsClient:
+        if self._client is None:
+            raise RuntimeError("XHSClient not initialized — call await client.setup() first")
+        return self._client
 
     async def _sleep(self) -> None:
         """Random delay between requests to avoid rate limits."""
@@ -94,7 +107,7 @@ class XHSClient:
         try:
             # xhs library returns the "data" portion of the API response
             data = await asyncio.to_thread(
-                self._client.get_note_by_keyword,
+                self._ensure_client().get_note_by_keyword,
                 keyword,
                 page=page,
                 page_size=page_size,
@@ -143,7 +156,7 @@ class XHSClient:
         await self._sleep()
         try:
             data = await asyncio.to_thread(
-                self._client.get_note_comments, note_id, cursor=cursor
+                self._ensure_client().get_note_comments, note_id, cursor=cursor
             )
 
             comments_raw = data.get("comments", [])
@@ -190,7 +203,7 @@ class XHSClient:
         await self._sleep()
         try:
             user_data = await asyncio.to_thread(
-                self._client.get_user_info, user_id
+                self._ensure_client().get_user_info, user_id
             )
             return {
                 "id": user_id,
@@ -226,7 +239,7 @@ class XHSClient:
         await self._sleep()
         try:
             data = await asyncio.to_thread(
-                self._client.get_user_notes, user_id, cursor=cursor
+                self._ensure_client().get_user_notes, user_id, cursor=cursor
             )
             notes = []
             for n in data.get("notes", []):

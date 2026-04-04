@@ -1,35 +1,118 @@
 #!/usr/bin/env python3
 """本地快速验证脚本：测试小红书爬虫能不能跑通。
 
-使用 xhs 库（带真实签名）替代之前的 MD5 占位签名。
+使用 Playwright 浏览器签名替代已过期的纯 Python 签名。
 
 用法:
-    python scripts/test_crawl.py --cookie "你从Chrome Network标签复制的完整cookie"
+    python scripts/test_crawl.py --cookie "你从Chrome Application标签拼出的完整cookie"
 
 获取 Cookie 的方法：
     1. Chrome 打开 xiaohongshu.com 并登录
-    2. F12 → Network 标签 → 刷新页面
-    3. 点一个请求（选 data 或 homefeed 等，避免 OPTIONS 请求）
-    4. 在 Request Headers 里找 Cookie，右键 Copy value
-    注意：不要用 Console 的 document.cookie，那个拿不到 httpOnly cookie！
+    2. F12 → Application 标签 → Cookies → xiaohongshu.com
+    3. 把所有 cookie 的 name=value 用分号拼起来
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import time
 
 from xhs import XhsClient
-from xhs.exception import DataFetchError, SignError, NeedVerifyError, IPBlockError
-from xhs.help import sign as xhs_sign
+from xhs.exception import DataFetchError, IPBlockError, NeedVerifyError, SignError
 
 
-def _sign(uri, data=None, a1="", web_session=""):
-    """Sign function for XhsClient."""
-    return xhs_sign(uri, data, a1=a1)
+# ── Playwright-based signer ────────────────────────────────────────
 
+_STEALTH_JS = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+    window.chrome = { runtime: {} };
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters);
+}
+"""
+
+
+def _parse_cookies(cookie_str: str, domain: str) -> list[dict]:
+    cookies = []
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        cookies.append({
+            "name": name.strip(),
+            "value": value.strip(),
+            "domain": domain,
+            "path": "/",
+        })
+    return cookies
+
+
+def setup_signer_sync(cookie: str):
+    """Start Playwright synchronously and return (sign_fn, cleanup_fn).
+
+    Uses playwright.sync_api to avoid async/sync bridging issues —
+    the xhs library calls sign_fn synchronously from requests.
+    """
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    )
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+    context.add_init_script(_STEALTH_JS)
+    if cookie:
+        context.add_cookies(_parse_cookies(cookie, ".xiaohongshu.com"))
+
+    page = context.new_page()
+    print("  正在加载小红书页面...")
+    page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded", timeout=30000)
+
+    print("  等待签名函数加载...")
+    try:
+        page.wait_for_function(
+            "() => typeof window._webmsxyw === 'function'",
+            timeout=15000,
+        )
+        print("  ✅ window._webmsxyw 已就绪")
+    except Exception as e:
+        print(f"  ❌ 签名函数未找到: {e}")
+        print("  尝试继续...")
+
+    import json
+
+    def sign_fn(uri, data=None, a1="", web_session=""):
+        data_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False) if data else ""
+        result = page.evaluate("([url, data]) => window._webmsxyw(url, data)", [uri, data_str])
+        return {
+            "x-s": result.get("X-s", ""),
+            "x-t": result.get("X-t", ""),
+            "x-s-common": result.get("X-s-common", ""),
+        }
+
+    def cleanup():
+        browser.close()
+        pw.stop()
+
+    return sign_fn, cleanup
+
+
+# ── Test steps ──────────────────────────────────────────────────────
 
 def test_step1_search(client: XhsClient) -> dict | None:
     """Step 1: 搜索关键词，看能不能拿到帖子。"""
@@ -66,8 +149,7 @@ def test_step1_search(client: XhsClient) -> dict | None:
         return first_note
 
     except SignError:
-        print("  ❌ 签名错误 — xhs 库的内置签名可能需要更新")
-        print("  建议：检查 xhs 库版本是否最新 (pip install --upgrade xhs)")
+        print("  ❌ 签名错误 — Playwright 签名可能失败")
         return None
     except NeedVerifyError as e:
         print(f"  ❌ 触发验证码 — {e}")
@@ -161,63 +243,71 @@ def test_step3_profile(client: XhsClient, user_id: str, nickname: str) -> None:
         print(f"  ❌ 笔记列表获取失败: {type(e).__name__}: {e}")
 
 
+# ── Main ────────────────────────────────────────────────────────────
+
 def main(cookie: str) -> None:
-    print("🔍 FindIt 爬虫验证工具 (xhs 库版)")
+    print("🔍 FindIt 爬虫验证工具 (Playwright 签名版)")
     print(f"Cookie长度: {len(cookie)} 字符")
 
     if len(cookie) < 50:
-        print("⚠️  Cookie 看起来太短了，请确认从 Network 标签复制了完整 Cookie")
+        print("⚠️  Cookie 看起来太短了，请确认包含完整 cookie")
         return
 
     if "web_session" not in cookie:
         print("⚠️  Cookie 中没有 web_session 字段")
-        print("   请从 Network 标签复制（不要用 Console 的 document.cookie）")
+        print("   请确认从 Application 标签复制了所有 cookie")
         print("   继续尝试...\n")
 
-    client = XhsClient(cookie=cookie, sign=_sign)
+    print("\n🚀 启动 Playwright 浏览器...")
+    sign_fn, cleanup = setup_signer_sync(cookie)
 
-    # Step 1: 搜索
-    first_note = test_step1_search(client)
-    if not first_note:
-        print("\n💡 Step 1 失败，后续步骤跳过。")
-        print("   常见原因：")
-        print("   1. Cookie 不完整 → 从 Network 标签重新复制")
-        print("   2. Cookie 过期 → 重新登录小红书")
-        print("   3. 签名被拦 → 检查 xhs 库版本")
-        return
+    try:
+        client = XhsClient(cookie=cookie, sign=sign_fn)
 
-    time.sleep(random.uniform(2, 4))
+        # Step 1: 搜索
+        first_note = test_step1_search(client)
+        if not first_note:
+            print("\n💡 Step 1 失败，后续步骤跳过。")
+            print("   常见原因：")
+            print("   1. Cookie 不完整或过期 → 重新登录小红书")
+            print("   2. 签名函数变更 → 检查 window._webmsxyw 是否存在")
+            print("   3. IP 被限制 → 等几分钟或换网络")
+            return
 
-    # Step 2: 评论
-    test_step2_comments(client, first_note["note_id"])
+        time.sleep(random.uniform(2, 4))
 
-    time.sleep(random.uniform(2, 4))
+        # Step 2: 评论
+        test_step2_comments(client, first_note["note_id"])
 
-    # Step 3: 主页
-    test_step3_profile(client, first_note["user_id"], first_note["nickname"])
+        time.sleep(random.uniform(2, 4))
 
-    # 总结
-    print("\n" + "=" * 50)
-    print("✅ 验证完成！")
-    print("=" * 50)
-    print()
-    print("如果三步都成功了，恭喜！爬虫可以正常工作。")
-    print("接下来：")
-    print("  1. 把 Cookie 填到 .env 文件的 XHS_COOKIE")
-    print("  2. 运行 findit-crawler-service 开始抓数据")
-    print()
-    print("如果有步骤失败了：")
-    print("  - 签名错误 → pip install --upgrade xhs")
-    print("  - 验证码 → 等几分钟或换 IP")
-    print("  - Cookie 问题 → 重新从 Network 标签复制")
+        # Step 3: 主页
+        test_step3_profile(client, first_note["user_id"], first_note["nickname"])
+
+        # 总结
+        print("\n" + "=" * 50)
+        print("✅ 验证完成！")
+        print("=" * 50)
+        print()
+        print("如果三步都成功了，恭喜！爬虫可以正常工作。")
+        print("接下来：")
+        print("  1. 把 Cookie 填到 .env 文件的 XHS_COOKIE")
+        print("  2. 运行 findit-crawler-service 开始抓数据")
+        print()
+        print("如果有步骤失败了：")
+        print("  - 签名错误 → 确认 Playwright 和 Chromium 已安装")
+        print("  - 验证码 → 等几分钟或换 IP")
+        print("  - Cookie 问题 → 重新从 Application 标签复制")
+    finally:
+        cleanup()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FindIt 爬虫本地验证（xhs 库版）")
+    parser = argparse.ArgumentParser(description="FindIt 爬虫本地验证（Playwright 签名版）")
     parser.add_argument(
         "--cookie",
         required=True,
-        help="小红书Cookie（从Chrome DevTools Network标签复制）",
+        help="小红书Cookie（从Chrome DevTools Application标签复制）",
     )
     args = parser.parse_args()
     main(args.cookie)

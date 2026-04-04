@@ -166,10 +166,14 @@ class CrawlRunner:
     async def run_full_pipeline(self) -> dict[str, int]:
         """Run all three steps in sequence."""
         logger.info("Starting full crawl pipeline")
-        posts = await self.step1_search_posts()
-        comments = await self.step2_scrape_comments()
-        profiles = await self.step3_scrape_profiles()
-        return {"posts": posts, "comments": comments, "profiles": profiles}
+        await self.client.setup()
+        try:
+            posts = await self.step1_search_posts()
+            comments = await self.step2_scrape_comments()
+            profiles = await self.step3_scrape_profiles()
+            return {"posts": posts, "comments": comments, "profiles": profiles}
+        finally:
+            await self.client.close()
 
 
 def _parse_int(value: str | int) -> int:
