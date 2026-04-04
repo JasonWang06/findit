@@ -97,13 +97,22 @@ def setup_signer_sync(cookie: str):
     import json
 
     def sign_fn(uri, data=None, a1="", web_session=""):
+        from xhs.help import b64Encode, encodeUtf8, mrc
+
         data_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False) if data else ""
         result = page.evaluate("([url, data]) => window._webmsxyw(url, data)", [uri, data_str])
-        return {
-            "x-s": result.get("X-s", ""),
-            "x-t": result.get("X-t", ""),
-            "x-s-common": result.get("X-s-common", ""),
-        }
+        x_s = result.get("X-s", "")
+        x_t = str(result.get("X-t", ""))
+        x_s_common = result.get("X-s-common", "")
+        if not x_s_common:
+            common = {
+                "s0": 5, "s1": "", "x0": "1", "x1": "3.2.0",
+                "x2": "Mac OS", "x3": "xhs-pc-web", "x4": "4.0.0",
+                "x5": a1, "x6": x_t, "x7": x_s, "x8": "",
+                "x9": mrc(x_t + x_s) if x_t and x_s else 0, "x10": 1,
+            }
+            x_s_common = b64Encode(encodeUtf8(json.dumps(common, separators=(",", ":"))))
+        return {"x-s": x_s, "x-t": x_t, "x-s-common": x_s_common}
 
     def cleanup():
         browser.close()

@@ -135,10 +135,19 @@ class PlaywrightSigner:
                     [uri, data_str],
                 )
 
+            x_s = result.get("X-s", "")
+            x_t = str(result.get("X-t", ""))
+
+            # x-s-common may be returned by _webmsxyw or needs to be
+            # generated from the Python helper as a fallback.
+            x_s_common = result.get("X-s-common", "")
+            if not x_s_common:
+                x_s_common = _build_xs_common(x_s, x_t, a1)
+
             headers = {
-                "x-s": result.get("X-s", ""),
-                "x-t": result.get("X-t", ""),
-                "x-s-common": result.get("X-s-common", ""),
+                "x-s": x_s,
+                "x-t": x_t,
+                "x-s-common": x_s_common,
             }
             logger.debug("Signed %s → x-t=%s", uri[:60], headers["x-t"])
             return headers
@@ -171,6 +180,34 @@ class PlaywrightSigner:
             self._playwright = None
         self._started = False
         logger.info("Playwright signer closed")
+
+
+def _build_xs_common(x_s: str, x_t: str, a1: str) -> str:
+    """Build x-s-common header using the xhs library's encoding utilities.
+
+    This is needed when window._webmsxyw doesn't return X-s-common directly.
+    Uses the same encoding as xhs.help.sign() but with the browser-generated
+    x-s and x-t values.
+    """
+    from xhs.help import b64Encode, encodeUtf8, mrc
+
+    common = {
+        "s0": 5,
+        "s1": "",
+        "x0": "1",
+        "x1": "3.2.0",
+        "x2": "Mac OS",
+        "x3": "xhs-pc-web",
+        "x4": "4.0.0",
+        "x5": a1,
+        "x6": x_t,
+        "x7": x_s,
+        "x8": "",
+        "x9": mrc(x_t + x_s) if x_t and x_s else 0,
+        "x10": 1,
+    }
+    encode_str = encodeUtf8(json.dumps(common, separators=(",", ":")))
+    return b64Encode(encode_str)
 
 
 def _parse_cookie_string(cookie_str: str, domain: str) -> list[dict]:
