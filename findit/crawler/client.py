@@ -16,7 +16,7 @@ from typing import Any
 from xhs import XhsClient as _XhsClient
 
 from findit.config import settings
-from findit.crawler.sign import PlaywrightSigner
+from findit.crawler.sign import USER_AGENT, PlaywrightSigner
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,15 @@ class XHSClient:
         self.cookie = cookie or settings.xhs_cookie
         self._delay_min = settings.crawl_request_delay_min
         self._delay_max = settings.crawl_request_delay_max
-        self._signer = PlaywrightSigner()
+
+        # Extract a1 and webId from the cookie string for the signer.
+        # These are device identifiers needed so the browser-generated
+        # signature matches the cookies sent in HTTP requests.
+        cookie_dict = _cookie_str_to_dict(self.cookie)
+        self._signer = PlaywrightSigner(
+            a1=cookie_dict.get("a1", ""),
+            web_id=cookie_dict.get("webId", ""),
+        )
         self._client: _XhsClient | None = None
 
     async def setup(self) -> None:
@@ -74,6 +82,7 @@ class XHSClient:
         self._client = _XhsClient(
             cookie=self.cookie,
             sign=self._signer.sign_sync,
+            user_agent=USER_AGENT,
         )
 
     async def close(self) -> None:
@@ -272,3 +281,14 @@ def _safe_int(value: Any) -> int:
         return int(value)
     except (ValueError, TypeError):
         return 0
+
+
+def _cookie_str_to_dict(cookie_str: str) -> dict[str, str]:
+    """Parse 'a1=xxx;webId=yyy' into {'a1': 'xxx', 'webId': 'yyy'}."""
+    result = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            result[name.strip()] = value.strip()
+    return result

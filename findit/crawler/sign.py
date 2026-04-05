@@ -19,6 +19,14 @@ from playwright.async_api import Page, async_playwright
 
 logger = logging.getLogger(__name__)
 
+# Shared User-Agent used by both Playwright and xhs HTTP requests.
+# Must be consistent so XHS doesn't detect a device mismatch.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 # Stealth evasions to prevent Playwright detection.
 _STEALTH_JS = """
 () => {
@@ -38,14 +46,17 @@ _STEALTH_JS = """
 class PlaywrightSigner:
     """Manages a persistent headless browser for XHS request signing.
 
-    The browser loads xiaohongshu.com anonymously (with a generated a1 cookie)
-    purely to access the window._webmsxyw() signing function. The user's
-    real cookie is NOT passed to the browser — it is only used by the
-    xhs library's HTTP requests, preventing session conflicts.
+    The browser loads xiaohongshu.com with the user's ``a1`` and ``webId``
+    cookies (device identifiers) so that the signing function produces
+    signatures that match the cookies sent in HTTP requests.
+
+    IMPORTANT: Only a1 and webId are set on the browser — NOT web_session
+    or other session cookies. This prevents the browser from creating a
+    conflicting login session that would kick the user out.
 
     Usage::
 
-        signer = PlaywrightSigner()
+        signer = PlaywrightSigner(a1="xxx", web_id="yyy")
         await signer.start()   # launches browser, loads XHS page
 
         # Called by XhsClient as external_sign callback (sync)
@@ -56,7 +67,9 @@ class PlaywrightSigner:
 
     XHS_HOME = "https://www.xiaohongshu.com"
 
-    def __init__(self):
+    def __init__(self, a1: str = "", web_id: str = ""):
+        self._a1 = a1
+        self._web_id = web_id
         self._playwright = None
         self._browser = None
         self._context = None
@@ -84,21 +97,21 @@ class PlaywrightSigner:
             ],
         )
         self._context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent=USER_AGENT,
         )
 
         # Inject stealth before any page loads
         await self._context.add_init_script(_STEALTH_JS)
 
-        # Generate a fresh anonymous a1/webId cookie so the page loads
-        # properly. We do NOT use the user's real cookie here — that
-        # would create a conflicting session and log the user out.
-        from xhs.help import get_a1_and_web_id
-        a1, web_id = get_a1_and_web_id()
+        # Set the user's a1 and webId cookies (device identifiers) so
+        # the signing function produces signatures that match. If not
+        # provided, generate fresh ones (signing may still work but
+        # the a1 won't match the HTTP request cookies).
+        a1 = self._a1
+        web_id = self._web_id
+        if not a1 or not web_id:
+            from xhs.help import get_a1_and_web_id
+            a1, web_id = get_a1_and_web_id()
         await self._context.add_cookies([
             {"name": "a1", "value": a1, "domain": ".xiaohongshu.com", "path": "/"},
             {"name": "webId", "value": web_id, "domain": ".xiaohongshu.com", "path": "/"},

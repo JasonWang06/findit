@@ -40,35 +40,50 @@ _STEALTH_JS = """
 
 
 
-def setup_signer_sync():
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _parse_cookie_str(cookie_str: str) -> dict[str, str]:
+    result = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            result[name.strip()] = value.strip()
+    return result
+
+
+def setup_signer_sync(cookie: str):
     """Start Playwright synchronously and return (sign_fn, cleanup_fn).
 
-    Uses playwright.sync_api to avoid async/sync bridging issues —
-    the xhs library calls sign_fn synchronously from requests.
-
-    The browser loads XHS anonymously (with a generated a1 cookie)
-    purely to access the signing JS function. The user's real cookie
-    is NOT passed here to avoid conflicting sessions.
+    Sets the user's a1 and webId cookies on the browser so the
+    signing function produces matching signatures. Does NOT set
+    web_session to avoid conflicting login sessions.
     """
     from playwright.sync_api import sync_playwright
-    from xhs.help import get_a1_and_web_id
+
+    cookie_dict = _parse_cookie_str(cookie)
+    a1 = cookie_dict.get("a1", "")
+    web_id = cookie_dict.get("webId", "")
+
+    # Fall back to generated values if missing
+    if not a1 or not web_id:
+        from xhs.help import get_a1_and_web_id
+        a1, web_id = get_a1_and_web_id()
 
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
         headless=True,
         args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
     )
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-    )
+    context = browser.new_context(user_agent=_USER_AGENT)
     context.add_init_script(_STEALTH_JS)
 
-    # Generate anonymous a1/webId so the page loads properly
-    a1, web_id = get_a1_and_web_id()
+    # Only set a1 and webId (device identifiers), NOT web_session
     context.add_cookies([
         {"name": "a1", "value": a1, "domain": ".xiaohongshu.com", "path": "/"},
         {"name": "webId", "value": web_id, "domain": ".xiaohongshu.com", "path": "/"},
@@ -263,10 +278,10 @@ def main(cookie: str) -> None:
         print("   继续尝试...\n")
 
     print("\n🚀 启动 Playwright 浏览器...")
-    sign_fn, cleanup = setup_signer_sync()
+    sign_fn, cleanup = setup_signer_sync(cookie)
 
     try:
-        client = XhsClient(cookie=cookie, sign=sign_fn)
+        client = XhsClient(cookie=cookie, sign=sign_fn, user_agent=_USER_AGENT)
 
         # Step 1: 搜索
         first_note = test_step1_search(client)
