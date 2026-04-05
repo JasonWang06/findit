@@ -38,9 +38,14 @@ _STEALTH_JS = """
 class PlaywrightSigner:
     """Manages a persistent headless browser for XHS request signing.
 
+    The browser loads xiaohongshu.com anonymously (with a generated a1 cookie)
+    purely to access the window._webmsxyw() signing function. The user's
+    real cookie is NOT passed to the browser — it is only used by the
+    xhs library's HTTP requests, preventing session conflicts.
+
     Usage::
 
-        signer = PlaywrightSigner(cookie="a1=xxx;web_session=yyy;...")
+        signer = PlaywrightSigner()
         await signer.start()   # launches browser, loads XHS page
 
         # Called by XhsClient as external_sign callback (sync)
@@ -51,8 +56,7 @@ class PlaywrightSigner:
 
     XHS_HOME = "https://www.xiaohongshu.com"
 
-    def __init__(self, cookie: str = ""):
-        self._cookie = cookie
+    def __init__(self):
         self._playwright = None
         self._browser = None
         self._context = None
@@ -62,7 +66,7 @@ class PlaywrightSigner:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
-        """Launch browser, inject stealth, navigate to XHS, set cookies."""
+        """Launch browser, inject stealth, navigate to XHS."""
         if self._started:
             return
 
@@ -90,10 +94,15 @@ class PlaywrightSigner:
         # Inject stealth before any page loads
         await self._context.add_init_script(_STEALTH_JS)
 
-        # Set cookies from the cookie string
-        if self._cookie:
-            cookies = _parse_cookie_string(self._cookie, ".xiaohongshu.com")
-            await self._context.add_cookies(cookies)
+        # Generate a fresh anonymous a1/webId cookie so the page loads
+        # properly. We do NOT use the user's real cookie here — that
+        # would create a conflicting session and log the user out.
+        from xhs.help import get_a1_and_web_id
+        a1, web_id = get_a1_and_web_id()
+        await self._context.add_cookies([
+            {"name": "a1", "value": a1, "domain": ".xiaohongshu.com", "path": "/"},
+            {"name": "webId", "value": web_id, "domain": ".xiaohongshu.com", "path": "/"},
+        ])
 
         self._page = await self._context.new_page()
         await self._page.goto(
@@ -210,18 +219,3 @@ def _build_xs_common(x_s: str, x_t: str, a1: str) -> str:
     return b64Encode(encode_str)
 
 
-def _parse_cookie_string(cookie_str: str, domain: str) -> list[dict]:
-    """Convert 'a1=xxx;b=yyy' into Playwright cookie dicts."""
-    cookies = []
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        cookies.append({
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": domain,
-            "path": "/",
-        })
-    return cookies

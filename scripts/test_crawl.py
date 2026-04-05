@@ -39,29 +39,19 @@ _STEALTH_JS = """
 """
 
 
-def _parse_cookies(cookie_str: str, domain: str) -> list[dict]:
-    cookies = []
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        cookies.append({
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": domain,
-            "path": "/",
-        })
-    return cookies
 
-
-def setup_signer_sync(cookie: str):
+def setup_signer_sync():
     """Start Playwright synchronously and return (sign_fn, cleanup_fn).
 
     Uses playwright.sync_api to avoid async/sync bridging issues —
     the xhs library calls sign_fn synchronously from requests.
+
+    The browser loads XHS anonymously (with a generated a1 cookie)
+    purely to access the signing JS function. The user's real cookie
+    is NOT passed here to avoid conflicting sessions.
     """
     from playwright.sync_api import sync_playwright
+    from xhs.help import get_a1_and_web_id
 
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
@@ -76,8 +66,13 @@ def setup_signer_sync(cookie: str):
         ),
     )
     context.add_init_script(_STEALTH_JS)
-    if cookie:
-        context.add_cookies(_parse_cookies(cookie, ".xiaohongshu.com"))
+
+    # Generate anonymous a1/webId so the page loads properly
+    a1, web_id = get_a1_and_web_id()
+    context.add_cookies([
+        {"name": "a1", "value": a1, "domain": ".xiaohongshu.com", "path": "/"},
+        {"name": "webId", "value": web_id, "domain": ".xiaohongshu.com", "path": "/"},
+    ])
 
     page = context.new_page()
     print("  正在加载小红书页面...")
@@ -268,7 +263,7 @@ def main(cookie: str) -> None:
         print("   继续尝试...\n")
 
     print("\n🚀 启动 Playwright 浏览器...")
-    sign_fn, cleanup = setup_signer_sync(cookie)
+    sign_fn, cleanup = setup_signer_sync()
 
     try:
         client = XhsClient(cookie=cookie, sign=sign_fn)

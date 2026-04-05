@@ -62,7 +62,7 @@ class XHSClient:
         self.cookie = cookie or settings.xhs_cookie
         self._delay_min = settings.crawl_request_delay_min
         self._delay_max = settings.crawl_request_delay_max
-        self._signer = PlaywrightSigner(cookie=self.cookie)
+        self._signer = PlaywrightSigner()
         self._client: _XhsClient | None = None
 
     async def setup(self) -> None:
