@@ -162,7 +162,9 @@ def main():
         sys.exit(1)
 
     # Find JSONL files
-    note_files = sorted(data_dir.glob("*note*"))
+    # MediaCrawler uses "search_contents_*.jsonl" for notes
+    # and "search_comments_*.jsonl" for comments
+    note_files = sorted(data_dir.glob("*content*")) or sorted(data_dir.glob("*note*"))
     comment_files = sorted(data_dir.glob("*comment*"))
 
     if not note_files and not comment_files:
