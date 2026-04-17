@@ -33,19 +33,24 @@ class CrawlRunner:
     ) -> int:
         """Search for dating-related posts and save to DB.
 
+        Continues to the next keyword on failure instead of aborting.
         Returns the number of new posts saved.
         """
         keywords = keywords or SEARCH_KEYWORDS
         saved = 0
+        errors = 0
 
         for kw in keywords:
+            empty_pages = 0
             for page in range(1, pages_per_keyword + 1):
                 results = await self.client.search_notes(kw, page=page)
                 if not results:
-                    break
+                    empty_pages += 1
+                    if empty_pages >= 2:
+                        break
+                    continue
 
                 for note in results:
-                    # Ensure author exists before upserting post
                     author = self.db.get_author(note["user_id"])
                     if not author:
                         self.db.upsert_author({
@@ -71,7 +76,7 @@ class CrawlRunner:
 
                 logger.info("Keyword '%s' page %d: saved %d posts", kw, page, len(results))
 
-        logger.info("Step 1 complete: saved %d posts total", saved)
+        logger.info("Step 1 complete: saved %d posts total (%d errors)", saved, errors)
         return saved
 
     async def step2_scrape_comments(self, max_posts: int = 50) -> int:
@@ -164,14 +169,31 @@ class CrawlRunner:
         return scraped
 
     async def run_full_pipeline(self) -> dict[str, int]:
-        """Run all three steps in sequence."""
+        """Run all three steps in sequence.
+
+        Each step runs independently — a failure in one step doesn't
+        prevent the others from executing.
+        """
         logger.info("Starting full crawl pipeline")
         await self.client.setup()
+        result = {"posts": 0, "comments": 0, "profiles": 0}
         try:
-            posts = await self.step1_search_posts()
-            comments = await self.step2_scrape_comments()
-            profiles = await self.step3_scrape_profiles()
-            return {"posts": posts, "comments": comments, "profiles": profiles}
+            try:
+                result["posts"] = await self.step1_search_posts()
+            except Exception:
+                logger.exception("Step 1 (search) failed, continuing to step 2")
+
+            try:
+                result["comments"] = await self.step2_scrape_comments()
+            except Exception:
+                logger.exception("Step 2 (comments) failed, continuing to step 3")
+
+            try:
+                result["profiles"] = await self.step3_scrape_profiles()
+            except Exception:
+                logger.exception("Step 3 (profiles) failed")
+
+            return result
         finally:
             await self.client.close()
 

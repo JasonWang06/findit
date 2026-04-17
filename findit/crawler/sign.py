@@ -6,6 +6,7 @@ and calls the real JavaScript signing function (window._webmsxyw) to
 generate valid x-s, x-t, x-s-common headers.
 
 The browser is started once and reused for all signing requests.
+If the browser crashes or signing fails repeatedly, it auto-restarts.
 """
 
 from __future__ import annotations
@@ -17,17 +18,16 @@ from typing import Any
 
 from playwright.async_api import Page, async_playwright
 
+from findit.config import settings
+
 logger = logging.getLogger(__name__)
 
-# Shared User-Agent used by both Playwright and xhs HTTP requests.
-# Must be consistent so XHS doesn't detect a device mismatch.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Stealth evasions to prevent Playwright detection.
 _STEALTH_JS = """
 () => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -42,27 +42,13 @@ _STEALTH_JS = """
 }
 """
 
+_MAX_SIGN_RETRIES = 3
+
 
 class PlaywrightSigner:
     """Manages a persistent headless browser for XHS request signing.
 
-    The browser loads xiaohongshu.com with the user's ``a1`` and ``webId``
-    cookies (device identifiers) so that the signing function produces
-    signatures that match the cookies sent in HTTP requests.
-
-    IMPORTANT: Only a1 and webId are set on the browser — NOT web_session
-    or other session cookies. This prevents the browser from creating a
-    conflicting login session that would kick the user out.
-
-    Usage::
-
-        signer = PlaywrightSigner(a1="xxx", web_id="yyy")
-        await signer.start()   # launches browser, loads XHS page
-
-        # Called by XhsClient as external_sign callback (sync)
-        headers = signer.sign_sync("/api/sns/web/v1/search/notes", data, a1, web_session)
-
-        await signer.close()   # cleanup
+    Auto-restarts if the browser dies or signing fails repeatedly.
     """
 
     XHS_HOME = "https://www.xiaohongshu.com"
@@ -77,36 +63,36 @@ class PlaywrightSigner:
         self._started = False
         self._async_lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._consecutive_failures = 0
 
     async def start(self) -> None:
-        """Launch browser, inject stealth, navigate to XHS."""
         if self._started:
             return
 
-        # Save a reference to the running event loop so sign_sync()
-        # can dispatch calls back from worker threads.
         self._loop = asyncio.get_running_loop()
+
+        page_timeout = settings.playwright_page_timeout
+        sign_timeout = settings.playwright_sign_timeout
 
         logger.info("Starting Playwright browser for XHS signing...")
         self._playwright = await async_playwright().start()
+
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+        proxy_cfg = None
+        if settings.crawl_proxy:
+            proxy_cfg = {"server": settings.crawl_proxy}
+
         self._browser = await self._playwright.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
+            args=launch_args,
+            proxy=proxy_cfg,
         )
-        self._context = await self._browser.new_context(
-            user_agent=USER_AGENT,
-        )
-
-        # Inject stealth before any page loads
+        self._context = await self._browser.new_context(user_agent=USER_AGENT)
         await self._context.add_init_script(_STEALTH_JS)
 
-        # Set the user's a1 and webId cookies (device identifiers) so
-        # the signing function produces signatures that match. If not
-        # provided, generate fresh ones (signing may still work but
-        # the a1 won't match the HTTP request cookies).
         a1 = self._a1
         web_id = self._web_id
         if not a1 or not web_id:
@@ -121,47 +107,62 @@ class PlaywrightSigner:
         await self._page.goto(
             self.XHS_HOME,
             wait_until="domcontentloaded",
-            timeout=30000,
+            timeout=page_timeout,
         )
 
-        # Wait for the signing function to be available
         await self._page.wait_for_function(
             "() => typeof window._webmsxyw === 'function'",
-            timeout=15000,
+            timeout=sign_timeout,
         )
         logger.info("Playwright signer ready — window._webmsxyw available")
         self._started = True
+        self._consecutive_failures = 0
+
+    async def restart(self) -> None:
+        logger.warning("Restarting Playwright signer...")
+        await self.close()
+        await self.start()
 
     async def sign(self, uri: str, data: Any = None, a1: str = "", web_session: str = "") -> dict[str, str]:
-        """Generate x-s, x-t, x-s-common headers via browser JS."""
         if not self._started or not self._page:
             raise RuntimeError("PlaywrightSigner not started — call start() first")
 
         async with self._async_lock:
             data_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False) if data else ""
 
-            try:
-                result = await self._page.evaluate(
-                    "([url, data]) => window._webmsxyw(url, data)",
-                    [uri, data_str],
-                )
-            except Exception:
-                logger.exception("window._webmsxyw call failed, reloading page...")
-                await self._page.reload(wait_until="domcontentloaded", timeout=30000)
-                await self._page.wait_for_function(
-                    "() => typeof window._webmsxyw === 'function'",
-                    timeout=15000,
-                )
-                result = await self._page.evaluate(
-                    "([url, data]) => window._webmsxyw(url, data)",
-                    [uri, data_str],
-                )
+            for attempt in range(_MAX_SIGN_RETRIES):
+                try:
+                    result = await self._page.evaluate(
+                        "([url, data]) => window._webmsxyw(url, data)",
+                        [uri, data_str],
+                    )
+                    self._consecutive_failures = 0
+                    break
+                except Exception:
+                    self._consecutive_failures += 1
+                    if attempt < _MAX_SIGN_RETRIES - 1:
+                        logger.warning(
+                            "Sign attempt %d/%d failed, reloading page...",
+                            attempt + 1, _MAX_SIGN_RETRIES,
+                        )
+                        try:
+                            await self._page.reload(
+                                wait_until="domcontentloaded",
+                                timeout=settings.playwright_page_timeout,
+                            )
+                            await self._page.wait_for_function(
+                                "() => typeof window._webmsxyw === 'function'",
+                                timeout=settings.playwright_sign_timeout,
+                            )
+                        except Exception:
+                            logger.warning("Page reload failed, will retry sign anyway")
+                    else:
+                        logger.error("All %d sign attempts exhausted", _MAX_SIGN_RETRIES)
+                        raise
 
             x_s = result.get("X-s", "")
             x_t = str(result.get("X-t", ""))
 
-            # x-s-common may be returned by _webmsxyw or needs to be
-            # generated from the Python helper as a fallback.
             x_s_common = result.get("X-s-common", "")
             if not x_s_common:
                 x_s_common = _build_xs_common(x_s, x_t, a1)
@@ -175,14 +176,6 @@ class PlaywrightSigner:
             return headers
 
     def sign_sync(self, uri: str, data: Any = None, a1: str = "", web_session: str = "") -> dict[str, str]:
-        """Synchronous wrapper for the xhs library's external_sign callback.
-
-        The xhs library calls this synchronously from its requests-based
-        HTTP methods. Since client.py wraps xhs calls with asyncio.to_thread(),
-        this runs in a worker thread. We use run_coroutine_threadsafe() to
-        dispatch the async sign() call back to the main event loop where
-        Playwright lives.
-        """
         if self._loop is None:
             raise RuntimeError("PlaywrightSigner not started — call start() first")
 
@@ -190,27 +183,28 @@ class PlaywrightSigner:
             self.sign(uri, data, a1, web_session),
             self._loop,
         )
-        return future.result(timeout=30)
+        return future.result(timeout=settings.crawl_request_timeout)
 
     async def close(self) -> None:
-        """Shut down browser and Playwright."""
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                logger.debug("Browser close error (ignored)")
             self._browser = None
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                logger.debug("Playwright stop error (ignored)")
             self._playwright = None
+        self._page = None
+        self._context = None
         self._started = False
         logger.info("Playwright signer closed")
 
 
 def _build_xs_common(x_s: str, x_t: str, a1: str) -> str:
-    """Build x-s-common header using the xhs library's encoding utilities.
-
-    This is needed when window._webmsxyw doesn't return X-s-common directly.
-    Uses the same encoding as xhs.help.sign() but with the browser-generated
-    x-s and x-t values.
-    """
     from xhs.help import b64Encode, encodeUtf8, mrc
 
     common = {
@@ -230,5 +224,3 @@ def _build_xs_common(x_s: str, x_t: str, a1: str) -> str:
     }
     encode_str = encodeUtf8(json.dumps(common, separators=(",", ":")))
     return b64Encode(encode_str)
-
-

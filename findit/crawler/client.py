@@ -14,11 +14,14 @@ import random
 from typing import Any
 
 from xhs import XhsClient as _XhsClient
+from xhs.exception import DataFetchError, IPBlockError, NeedVerifyError, SignError
 
 from findit.config import settings
 from findit.crawler.sign import USER_AGENT, PlaywrightSigner
 
 logger = logging.getLogger(__name__)
+
+_RETRYABLE = (IPBlockError, NeedVerifyError, SignError, DataFetchError, TimeoutError, OSError)
 
 # Common search keywords for dating-related content
 SEARCH_KEYWORDS = [
@@ -52,6 +55,9 @@ class XHSClient:
     The xhs library is synchronous, so all API calls are wrapped
     with asyncio.to_thread() to avoid blocking the event loop.
 
+    Includes retry with exponential backoff for transient failures
+    and per-request timeouts.
+
     Must call ``await client.setup()`` before use and
     ``await client.close()`` when done.
     """
@@ -62,10 +68,10 @@ class XHSClient:
         self.cookie = cookie or settings.xhs_cookie
         self._delay_min = settings.crawl_request_delay_min
         self._delay_max = settings.crawl_request_delay_max
+        self._max_retries = settings.crawl_max_retries
+        self._retry_base = settings.crawl_retry_base_delay
+        self._request_timeout = settings.crawl_request_timeout
 
-        # Extract a1 and webId from the cookie string for the signer.
-        # These are device identifiers needed so the browser-generated
-        # signature matches the cookies sent in HTTP requests.
         cookie_dict = _cookie_str_to_dict(self.cookie)
         self._signer = PlaywrightSigner(
             a1=cookie_dict.get("a1", ""),
@@ -74,10 +80,6 @@ class XHSClient:
         self._client: _XhsClient | None = None
 
     async def setup(self) -> None:
-        """Start the Playwright browser and initialize the xhs client.
-
-        Must be called once before making any API requests.
-        """
         await self._signer.start()
         self._client = _XhsClient(
             cookie=self.cookie,
@@ -86,7 +88,6 @@ class XHSClient:
         )
 
     async def close(self) -> None:
-        """Shut down the Playwright browser."""
         await self._signer.close()
 
     def _ensure_client(self) -> _XhsClient:
@@ -95,9 +96,49 @@ class XHSClient:
         return self._client
 
     async def _sleep(self) -> None:
-        """Random delay between requests to avoid rate limits."""
         delay = random.uniform(self._delay_min, self._delay_max)
         await asyncio.sleep(delay)
+
+    async def _call_with_retry(self, fn, *args, **kwargs) -> Any:
+        """Call a sync xhs function with timeout, retry, and exponential backoff."""
+        last_exc = None
+        for attempt in range(self._max_retries + 1):
+            if attempt > 0:
+                backoff = self._retry_base * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                logger.warning("Retry %d/%d in %.1fs...", attempt, self._max_retries, backoff)
+                await asyncio.sleep(backoff)
+
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(fn, *args, **kwargs),
+                    timeout=self._request_timeout,
+                )
+            except NeedVerifyError:
+                logger.warning("CAPTCHA triggered, backing off longer...")
+                await asyncio.sleep(30 + random.uniform(0, 30))
+                last_exc = NeedVerifyError("captcha")
+            except IPBlockError as e:
+                logger.warning("IP blocked: %s", e)
+                last_exc = e
+            except SignError as e:
+                logger.warning("Sign error (attempt %d): %s", attempt + 1, e)
+                if self._signer._started:
+                    await self._signer.restart()
+                    self._client = _XhsClient(
+                        cookie=self.cookie,
+                        sign=self._signer.sign_sync,
+                        user_agent=USER_AGENT,
+                    )
+                last_exc = e
+            except (DataFetchError, TimeoutError, OSError) as e:
+                logger.warning("Transient error (attempt %d): %s", attempt + 1, e)
+                last_exc = e
+            except Exception as e:
+                logger.exception("Non-retryable error: %s", e)
+                raise
+
+        logger.error("All %d retries exhausted", self._max_retries + 1)
+        raise last_exc or RuntimeError("Retries exhausted")
 
     # ── Step 1: Search posts by keyword ─────────────────────────────────
 
@@ -108,14 +149,9 @@ class XHSClient:
         page: int = 1,
         page_size: int = 20,
     ) -> list[dict[str, Any]]:
-        """Search Xiaohongshu notes by keyword.
-
-        Returns a list of note summary dicts with normalized field names.
-        """
         await self._sleep()
         try:
-            # xhs library returns the "data" portion of the API response
-            data = await asyncio.to_thread(
+            data = await self._call_with_retry(
                 self._ensure_client().get_note_by_keyword,
                 keyword,
                 page=page,
@@ -158,13 +194,9 @@ class XHSClient:
     async def get_note_comments(
         self, note_id: str, cursor: str = "", page_size: int = 20
     ) -> tuple[list[dict[str, Any]], str]:
-        """Fetch comments for a note.
-
-        Returns (comments_list, next_cursor). Empty cursor means no more pages.
-        """
         await self._sleep()
         try:
-            data = await asyncio.to_thread(
+            data = await self._call_with_retry(
                 self._ensure_client().get_note_comments, note_id, cursor=cursor
             )
 
@@ -197,7 +229,6 @@ class XHSClient:
             return [], ""
 
     def filter_dating_comments(self, comments: list[dict]) -> list[dict]:
-        """Filter comments that show dating intent based on keywords."""
         matches = []
         for c in comments:
             content_lower = c.get("content", "").lower()
@@ -208,10 +239,9 @@ class XHSClient:
     # ── Step 3: Get user profile ────────────────────────────────────────
 
     async def get_user_profile(self, user_id: str) -> dict[str, Any]:
-        """Fetch a user's public profile information."""
         await self._sleep()
         try:
-            user_data = await asyncio.to_thread(
+            user_data = await self._call_with_retry(
                 self._ensure_client().get_user_info, user_id
             )
             return {
@@ -244,10 +274,9 @@ class XHSClient:
     async def get_user_notes(
         self, user_id: str, cursor: str = "", page_size: int = 15
     ) -> tuple[list[dict[str, Any]], str]:
-        """Fetch notes published by a user (for profile analysis)."""
         await self._sleep()
         try:
-            data = await asyncio.to_thread(
+            data = await self._call_with_retry(
                 self._ensure_client().get_user_notes, user_id, cursor=cursor
             )
             notes = []
@@ -267,16 +296,13 @@ class XHSClient:
             return [], ""
 
     def get_note_url(self, note_id: str) -> str:
-        """Build the public URL for a note."""
         return f"{self.WEB_URL}/explore/{note_id}"
 
     def get_user_url(self, user_id: str) -> str:
-        """Build the public URL for a user profile."""
         return f"{self.WEB_URL}/user/profile/{user_id}"
 
 
 def _safe_int(value: Any) -> int:
-    """Safely convert a value to int."""
     try:
         return int(value)
     except (ValueError, TypeError):
@@ -284,7 +310,6 @@ def _safe_int(value: Any) -> int:
 
 
 def _cookie_str_to_dict(cookie_str: str) -> dict[str, str]:
-    """Parse 'a1=xxx;webId=yyy' into {'a1': 'xxx', 'webId': 'yyy'}."""
     result = {}
     for part in cookie_str.split(";"):
         part = part.strip()

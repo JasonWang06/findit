@@ -100,11 +100,13 @@ class CrawlerService:
     async def run_forever(self, interval_hours: int | None = None) -> None:
         """Run the crawl+filter cycle continuously.
 
-        Loops until SIGTERM/SIGINT is received.
+        Uses exponential backoff on consecutive failures (retry sooner
+        instead of waiting the full interval). Resets on success.
         """
         interval = (interval_hours or settings.crawl_interval_hours) * 3600
+        consecutive_failures = 0
+        max_backoff = interval
 
-        # Register signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._shutdown.set)
@@ -116,16 +118,23 @@ class CrawlerService:
         while not self._shutdown.is_set():
             try:
                 await self.run_once()
+                consecutive_failures = 0
             except Exception:
-                logger.exception("Crawler cycle failed, will retry next interval")
-
-            # Wait for the interval or until shutdown is requested
-            try:
-                await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=interval
+                consecutive_failures += 1
+                logger.exception(
+                    "Crawler cycle failed (%d consecutive)", consecutive_failures
                 )
+
+            if consecutive_failures > 0:
+                wait = min(300 * (2 ** (consecutive_failures - 1)), max_backoff)
+                logger.info("Retrying in %d seconds (backoff)", wait)
+            else:
+                wait = interval
+
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
             except asyncio.TimeoutError:
-                pass  # Normal: timeout means it's time for the next cycle
+                pass
 
         logger.info("Crawler service shutting down gracefully")
 

@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     crawl_interval_hours: int = 24
     crawl_request_delay_min: float = 2.0
     crawl_request_delay_max: float = 5.0
+    crawl_max_retries: int = 3
+    crawl_retry_base_delay: float = 5.0
+    crawl_request_timeout: float = 30.0
+    crawl_proxy: str = ""
+
+    # Playwright browser timeouts (milliseconds)
+    playwright_page_timeout: int = 30000
+    playwright_sign_timeout: int = 15000
 
     # Crawler service
     crawler_continuous: bool = True  # True = run_forever, False = run_once
