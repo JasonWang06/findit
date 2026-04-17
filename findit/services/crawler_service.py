@@ -42,7 +42,9 @@ class CrawlerService:
         """
         # Step 1: Crawl
         logger.info("=== Crawler Service: Step 1 - Crawling ===")
-        crawl_result = await self.crawler.run_full_pipeline()
+        crawl_result = await self.crawler.run_full_pipeline(
+            include_profiles=settings.crawl_include_profiles,
+        )
         logger.info("Crawl results: %s", crawl_result)
 
         # Step 2: Shared filtering (user-independent)

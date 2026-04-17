@@ -38,6 +38,7 @@ class Settings(BaseSettings):
 
     # Crawler service
     crawler_continuous: bool = True  # True = run_forever, False = run_once
+    crawl_include_profiles: bool = False  # profile scraping needs login, off by default
 
     # Recommendation
     daily_match_count: int = 5

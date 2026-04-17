@@ -1,9 +1,12 @@
-"""Three-step crawl pipeline: search → comments → profiles.
+"""Two-step crawl pipeline: search → comments.
 
-Orchestrates the full crawl cycle:
-  Step 1: Search keywords → collect posts
+Orchestrates the stable crawl cycle that doesn't require login:
+  Step 1: Search keywords → collect posts + author stubs
   Step 2: Scrape comments on those posts → find dating-intent commenters
-  Step 3: Scrape profiles for all candidate authors
+
+Profile scraping (step 3) is optional and disabled by default because
+the user_posted and get_user_info APIs require login state, which is
+fragile and causes account issues.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class CrawlRunner:
-    """Runs the three-step crawl pipeline."""
+    """Runs the crawl pipeline."""
 
     def __init__(self, db: Database | None = None, client: XHSClient | None = None):
         self.db = db or Database(settings.db_path)
@@ -34,11 +37,9 @@ class CrawlRunner:
         """Search for dating-related posts and save to DB.
 
         Continues to the next keyword on failure instead of aborting.
-        Returns the number of new posts saved.
         """
         keywords = keywords or SEARCH_KEYWORDS
         saved = 0
-        errors = 0
 
         for kw in keywords:
             empty_pages = 0
@@ -76,18 +77,13 @@ class CrawlRunner:
 
                 logger.info("Keyword '%s' page %d: saved %d posts", kw, page, len(results))
 
-        logger.info("Step 1 complete: saved %d posts total (%d errors)", saved, errors)
+        logger.info("Step 1 complete: saved %d posts total", saved)
         return saved
 
     async def step2_scrape_comments(self, max_posts: int = 50) -> int:
-        """Scrape comments on recent posts and find dating-intent commenters.
-
-        Returns count of dating-intent comments found.
-        """
-        # Get recent posts to scrape comments from
+        """Scrape comments on recent posts and find dating-intent commenters."""
         posts = self.db.get_scored_posts(limit=max_posts)
         if not posts:
-            # Fallback: get any posts
             with self.db._conn() as conn:
                 rows = conn.execute(
                     "SELECT * FROM posts WHERE source_type='post' ORDER BY crawled_at DESC LIMIT ?",
@@ -105,7 +101,6 @@ class CrawlRunner:
                 if not user_id:
                     continue
 
-                # Create author stub if not exists
                 author = self.db.get_author(user_id)
                 if not author:
                     self.db.upsert_author({
@@ -115,7 +110,6 @@ class CrawlRunner:
                         "ip_location": c.get("ip_location"),
                     })
 
-                # Save the comment as a pseudo-post (source_type='comment')
                 comment_id = f"comment_{c['comment_id']}"
                 self.db.upsert_post({
                     "id": comment_id,
@@ -135,12 +129,12 @@ class CrawlRunner:
         return found
 
     async def step3_scrape_profiles(self, limit: int = 50) -> int:
-        """Scrape full profiles for authors that haven't been fetched yet.
+        """Scrape full profiles for authors (requires login — use sparingly).
 
-        Returns count of profiles scraped.
+        This step is OPTIONAL. The search + comments pipeline works
+        without it. Only enable when you have a stable cookie setup.
         """
         author_ids = self.db.get_unscraped_author_ids(limit=limit)
-        # Also get authors with minimal data
         with self.db._conn() as conn:
             rows = conn.execute(
                 """SELECT id FROM authors
@@ -158,9 +152,8 @@ class CrawlRunner:
             if not profile.get("nickname"):
                 continue
 
-            # Also fetch their recent notes for analysis
             notes, _ = await self.client.get_user_notes(uid)
-            profile["notes_summary"] = notes[:10]  # Keep top 10
+            profile["notes_summary"] = notes[:10]
 
             self.db.upsert_author(profile)
             scraped += 1
@@ -168,13 +161,13 @@ class CrawlRunner:
         logger.info("Step 3 complete: scraped %d profiles", scraped)
         return scraped
 
-    async def run_full_pipeline(self) -> dict[str, int]:
-        """Run all three steps in sequence.
+    async def run_full_pipeline(self, include_profiles: bool = False) -> dict[str, int]:
+        """Run the crawl pipeline.
 
-        Each step runs independently — a failure in one step doesn't
-        prevent the others from executing.
+        By default only runs search + comments (stable, no login needed).
+        Set include_profiles=True to also scrape user profiles (requires login).
         """
-        logger.info("Starting full crawl pipeline")
+        logger.info("Starting crawl pipeline (profiles=%s)", include_profiles)
         await self.client.setup()
         result = {"posts": 0, "comments": 0, "profiles": 0}
         try:
@@ -186,12 +179,13 @@ class CrawlRunner:
             try:
                 result["comments"] = await self.step2_scrape_comments()
             except Exception:
-                logger.exception("Step 2 (comments) failed, continuing to step 3")
+                logger.exception("Step 2 (comments) failed")
 
-            try:
-                result["profiles"] = await self.step3_scrape_profiles()
-            except Exception:
-                logger.exception("Step 3 (profiles) failed")
+            if include_profiles:
+                try:
+                    result["profiles"] = await self.step3_scrape_profiles()
+                except Exception:
+                    logger.exception("Step 3 (profiles) failed")
 
             return result
         finally:
@@ -199,13 +193,11 @@ class CrawlRunner:
 
 
 def _parse_int(value: str | int) -> int:
-    """Parse integer from string, handling Chinese number suffixes."""
     if isinstance(value, int):
         return value
     value = str(value).strip()
     if not value:
         return 0
-    # Handle "1.2万" format
     if value.endswith("万"):
         try:
             return int(float(value[:-1]) * 10000)
