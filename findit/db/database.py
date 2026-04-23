@@ -162,6 +162,28 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_posts_without_tags(self, limit: int = 100, source_type: str | None = None) -> list[dict]:
+        """Get posts that haven't had AI tag extraction yet."""
+        with self._conn() as conn:
+            query = """SELECT * FROM posts WHERE ai_tags IS NULL"""
+            params = []
+            if source_type:
+                query += " AND source_type = ?"
+                params.append(source_type)
+            query += " ORDER BY crawled_at DESC LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_post_tags(self, post_id: str, tags: dict) -> None:
+        """Update AI tags for a post."""
+        with self._conn() as conn:
+            conn.execute(
+                """UPDATE posts SET ai_tags = ? WHERE id = ?""",
+                (json.dumps(tags, ensure_ascii=False), post_id),
+            )
+
     def get_scored_posts(self, city: str | None = None, limit: int = 200) -> list[dict]:
         """Get posts with AI scores, optionally filtered by city."""
         with self._conn() as conn:
