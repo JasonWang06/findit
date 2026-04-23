@@ -1,0 +1,19 @@
+# Ignore sensitive and large files in data directory
+
+# MediaCrawler raw data (too large, can be re-crawled)
+raw_pages/
+test_pages/
+playwright_pages/
+
+# Cookie files (sensitive)
+*xhs_cookies*.json
+*cookies*.json
+
+# Temporary files
+*.tmp
+*.temp
+parsed_results.json
+
+# Keep these:
+# - findit.db (main database)
+# - sample_data.txt (if created)

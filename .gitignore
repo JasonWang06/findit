@@ -7,6 +7,7 @@ build/
 .eggs/
 *.db
 *.sqlite
+!data/findit.db  # Allow our main database
 .env
 .env.*
 !.env.example
