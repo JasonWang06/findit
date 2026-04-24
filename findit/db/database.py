@@ -42,6 +42,46 @@ CREATE TABLE IF NOT EXISTS authors (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS user_profiles (
+    author_id TEXT PRIMARY KEY,
+    gender TEXT,
+    age INTEGER,
+    locations TEXT DEFAULT '[]',           -- JSON array
+    occupations TEXT DEFAULT '[]',         -- JSON array
+    height INTEGER,
+    education TEXT DEFAULT '[]',           -- JSON array
+    status TEXT,                           -- relationship status
+    personality TEXT DEFAULT '[]',         -- JSON array
+    interests TEXT DEFAULT '[]',           -- JSON array
+    requirements TEXT DEFAULT '{}',        -- JSON object
+    confidence_score REAL DEFAULT 0.0,     -- 0.0 - 1.0
+    profile_complete REAL DEFAULT 0.0,     -- 0.0 - 1.0
+    data_source TEXT,                      -- 'crawler_inferred' | 'self_reported'
+    source_post_id TEXT,
+    raw_text_summary TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    FOREIGN KEY (author_id) REFERENCES authors(id)
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    author_id TEXT PRIMARY KEY,
+    age_range_min INTEGER,
+    age_range_max INTEGER,
+    min_height INTEGER,
+    max_height INTEGER,
+    preferred_locations TEXT DEFAULT '[]',
+    preferred_occupations TEXT DEFAULT '[]',
+    preferred_education TEXT DEFAULT '[]',
+    gender_preference TEXT,
+    location_preference TEXT,
+    financial_preference TEXT,
+    looks_preference TEXT,
+    marriage_preference TEXT,
+    updated_at TEXT,
+    FOREIGN KEY (author_id) REFERENCES authors(id)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id TEXT UNIQUE NOT NULL,
@@ -157,10 +197,226 @@ class Database:
                 """SELECT p.* FROM posts p
                    JOIN authors a ON p.author_id = a.id
                    WHERE a.is_filtered_out = 0 AND a.is_real_person IS NULL
-                   ORDER BY p.crawled_at DESC LIMIT ?""",
+                   ORDER BY p.likes DESC
+                   LIMIT ?""",
                 (limit,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(row) for row in rows]
+
+    def get_posts_for_profile_extraction(self, limit: int = 100) -> list[dict]:
+        """Get posts suitable for profile extraction (dating-related content)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT p.*, a.nickname
+                   FROM posts p
+                   JOIN authors a ON p.author_id = a.id
+                   WHERE (p.content LIKE '%找对象%'
+                      OR p.content LIKE '%相亲%'
+                      OR p.content LIKE '%交友%'
+                      OR p.content LIKE '%脱单%'
+                      OR p.content LIKE '%单身%'
+                      OR p.content LIKE '%谈恋爱%'
+                      OR p.content LIKE '%女朋友%'
+                      OR p.content LIKE '%男朋友%')
+                   AND p.source_type = 'post'
+                   ORDER BY p.likes DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ── User Profiles ───────────────────────────────────────────────────────
+
+    def update_user_profile(self, author_id: str, profile: dict, confidence: float, source_post_id: str = None) -> bool:
+        """Update or insert user profile from extracted data."""
+        try:
+            with self._conn() as conn:
+                # Check if profile exists
+                existing = conn.execute(
+                    "SELECT confidence_score FROM user_profiles WHERE author_id = ?",
+                    (author_id,)
+                ).fetchone()
+
+                now = datetime.now().isoformat()
+
+                # Only update if new confidence is higher
+                if existing and existing['confidence_score'] > confidence:
+                    return False
+
+                conn.execute(
+                    """INSERT INTO user_profiles
+                       (author_id, gender, age, locations, occupations, height, education, status,
+                        personality, interests, requirements, confidence_score, data_source,
+                        source_post_id, raw_text_summary, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(author_id) DO UPDATE SET
+                       gender=excluded.gender,
+                       age=excluded.age,
+                       locations=excluded.locations,
+                       occupations=excluded.occupations,
+                       height=excluded.height,
+                       education=excluded.education,
+                       status=excluded.status,
+                       personality=excluded.personality,
+                       interests=excluded.interests,
+                       requirements=excluded.requirements,
+                       confidence_score=excluded.confidence_score,
+                       updated_at=excluded.updated_at""",
+                    (
+                        author_id,
+                        profile.get('gender'),
+                        profile.get('age'),
+                        json.dumps(profile.get('locations', []), ensure_ascii=False),
+                        json.dumps(profile.get('occupations', []), ensure_ascii=False),
+                        profile.get('height'),
+                        json.dumps(profile.get('education', []), ensure_ascii=False),
+                        profile.get('status'),
+                        json.dumps(profile.get('personality', []), ensure_ascii=False),
+                        json.dumps(profile.get('interests', []), ensure_ascii=False),
+                        json.dumps(profile.get('requirements', {}), ensure_ascii=False),
+                        confidence,
+                        'crawler_inferred',
+                        source_post_id,
+                        profile.get('raw_text', '')[:200],
+                        now,
+                        now,
+                    )
+                )
+                return True
+        except Exception as e:
+            print(f"Error updating profile: {e}")
+            return False
+
+    def get_user_profile(self, author_id: str) -> dict:
+        """Get user profile by author ID."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM user_profiles WHERE author_id = ?",
+                (author_id,)
+            ).fetchone()
+
+            if not row:
+                return {}
+
+            profile = dict(row)
+            # Parse JSON fields
+            for field in ['locations', 'occupations', 'education', 'personality', 'interests', 'requirements']:
+                if profile.get(field):
+                    try:
+                        profile[field] = json.loads(profile[field])
+                    except:
+                        profile[field] = []
+            return profile
+
+    def search_profiles(self, **filters) -> list[dict]:
+        """Search user profiles by filters."""
+        conditions = []
+        params = []
+
+        if 'gender' in filters:
+            conditions.append("gender = ?")
+            params.append(filters['gender'])
+
+        if 'min_age' in filters:
+            conditions.append("age >= ?")
+            params.append(filters['min_age'])
+
+        if 'max_age' in filters:
+            conditions.append("age <= ?")
+            params.append(filters['max_age'])
+
+        if 'location' in filters:
+            conditions.append("locations LIKE ?")
+            params.append(f"%{filters['location']}%")
+
+        if 'min_confidence' in filters:
+            conditions.append("confidence_score >= ?")
+            params.append(filters['min_confidence'])
+
+        if 'status' in filters:
+            conditions.append("status = ?")
+            params.append(filters['status'])
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""SELECT up.*, a.nickname, a.avatar_url, a.ip_location
+                   FROM user_profiles up
+                   JOIN authors a ON up.author_id = a.id
+                   WHERE {where_clause}
+                   ORDER BY confidence_score DESC, age ASC
+                   LIMIT 100""",
+                params
+            ).fetchall()
+
+            results = []
+            for row in rows:
+                profile = dict(row)
+                # Parse JSON fields
+                for field in ['locations', 'occupations', 'education', 'personality', 'interests', 'requirements']:
+                    if profile.get(field):
+                        try:
+                            profile[field] = json.loads(profile[field])
+                        except:
+                            profile[field] = []
+                results.append(profile)
+
+            return results
+
+    def print_profile_statistics(self):
+        """Print user profile statistics."""
+        with self._conn() as conn:
+            total = conn.execute("SELECT COUNT(*) as count FROM user_profiles").fetchone()['count']
+            high_conf = conn.execute("SELECT COUNT(*) as count FROM user_profiles WHERE confidence_score >= 0.7").fetchone()['count']
+            med_conf = conn.execute("SELECT COUNT(*) as count FROM user_profiles WHERE confidence_score >= 0.5 AND confidence_score < 0.7").fetchone()['count']
+
+            # Gender distribution
+            gender_dist = conn.execute("""
+                SELECT
+                    COALESCE(gender, 'unknown') as gender,
+                    COUNT(*) as count
+                FROM user_profiles
+                GROUP BY gender
+            """).fetchall()
+
+            # Age distribution
+            age_dist = conn.execute("""
+                SELECT
+                    CASE
+                        WHEN age < 23 THEN '18-22'
+                        WHEN age < 26 THEN '23-25'
+                        WHEN age < 30 THEN '26-29'
+                        WHEN age < 35 THEN '30-34'
+                        WHEN age >= 35 THEN '35+'
+                        ELSE 'unknown'
+                    END as age_group,
+                    COUNT(*) as count
+                FROM user_profiles
+                WHERE age IS NOT NULL
+                GROUP BY age_group
+            """).fetchall()
+
+            print(f"  总用户画像: {total}")
+            print(f"  ├─ 高可信度 (≥70%): {high_conf}")
+            print(f"  ├─ 中等可信度 (50-70%): {med_conf}")
+            print(f"  └─ 低可信度 (<50%): {total - high_conf - med_conf}")
+
+            print(f"\n  性别分布:")
+            for row in gender_dist:
+                print(f"    {row['gender']}: {row['count']}")
+
+            print(f"\n  年龄分布:")
+            for row in age_dist:
+                print(f"    {row['age_group']}: {row['count']}")
+
+            return {
+                'total': total,
+                'high_confidence': high_conf,
+                'medium_confidence': med_conf,
+                'gender_distribution': {r['gender']: r['count'] for r in gender_dist},
+                'age_distribution': {r['age_group']: r['count'] for r in age_dist}
+            }
 
     def get_posts_without_tags(self, limit: int = 100, source_type: str | None = None) -> list[dict]:
         """Get posts that haven't had AI tag extraction yet."""
