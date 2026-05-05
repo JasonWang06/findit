@@ -36,6 +36,7 @@ class TestCrawlerServiceFilter:
         assert "matchmaker" in author["filter_reason"]
 
     def test_shared_filter_passes_normal(self):
+        """Early-stage pass-through: stays pending_profile, no is_real_person yet."""
         db = _make_db()
         db.upsert_author({
             "id": "a2",
@@ -46,21 +47,54 @@ class TestCrawlerServiceFilter:
         })
 
         service = CrawlerService(db=db)
-        filtered = service.run_shared_filter()
+        filtered = service.run_shared_filter(final=False)
 
         assert filtered == 0
         author = db.get_author("a2")
         assert author["is_filtered_out"] == 0
-        assert author["is_real_person"] == 0.5  # Placeholder
+        assert author["crawl_state"] == "pending_profile"
+        assert author["is_real_person"] is None  # set only after final filter
 
-    def test_shared_filter_filters_empty_account(self):
+    def test_shared_filter_promotes_to_kept_when_final(self):
+        """After Step 3 + final filter, pass-through → crawl_state='kept'."""
+        db = _make_db()
+        db.upsert_author({
+            "id": "a5",
+            "nickname": "小花",
+            "bio": "爱旅行",
+            "ip_location": "深圳",
+            "notes_summary": [{"title": "周末日常"}],
+        })
+        db.upsert_post({
+            "id": "p5",
+            "author_id": "a5",
+            "content": "周末跟朋友去爬山,风景超好",
+            "source_type": "post",
+        })
+        db.mark_profile_crawled("a5")
+
+        service = CrawlerService(db=db)
+        filtered = service.run_shared_filter(final=True)
+
+        assert filtered == 0
+        author = db.get_author("a5")
+        assert author["crawl_state"] == "kept"
+        assert author["is_real_person"] == 0.5
+
+    def test_shared_filter_marks_proxy_post(self):
+        """Posts saying 代发 / 已获本人同意 → matchmaker_proxy_post."""
         db = _make_db()
         db.upsert_author({
             "id": "a3",
-            "nickname": "user123",
+            "nickname": "小花",
             "bio": "",
-            "following": 0,
-            "notes_summary": [],
+            "ip_location": "深圳",
+        })
+        db.upsert_post({
+            "id": "p3",
+            "author_id": "a3",
+            "content": "代发,已获本人同意,98年女生找对象",
+            "source_type": "post",
         })
 
         service = CrawlerService(db=db)
@@ -69,6 +103,7 @@ class TestCrawlerServiceFilter:
         assert filtered == 1
         author = db.get_author("a3")
         assert author["is_filtered_out"] == 1
+        assert author["filter_reason"] == "matchmaker_proxy_post"
 
     def test_shared_filter_skips_already_filtered(self):
         """Authors already filtered should not be re-processed."""

@@ -1,15 +1,13 @@
-"""Crawler background service: crawl + shared filtering.
+"""Crawler background service: two-stage filter per `docs/DATA_SPEC.md`.
 
-Runs independently of any user. Populates the shared data pool
-that the matching service draws from.
+Stage 1 (early): Step 1/2 lands posts + comments → `run_shared_filter(final=False)`
+    runs Rule A/B on what's already known; matchmakers/proxy posts get
+    crawl_state='filtered_out' early so we don't waste a Step 3 request on them.
 
-Pipeline per cycle:
-  1. CrawlRunner: search → comments → profiles
-  2. SharedFilter: keyword/heuristic filtering on new authors
-
-Architecture note: an LLM screening step can be inserted between
-step 2 and the matching service later, if keyword filtering proves
-insufficient for certain edge cases.
+Stage 2 (final): once Step 3 has run on a pending_profile author and
+    `profile_crawled_at` is set, `run_shared_filter(final=True)` re-evaluates
+    with notes_summary visible, and enforces §2 minimum-data bar
+    (ip_location + ≥12-char content). Survivors flip to crawl_state='kept'.
 """
 
 from __future__ import annotations
@@ -36,68 +34,103 @@ class CrawlerService:
         self._shutdown = asyncio.Event()
 
     async def run_once(self) -> dict:
-        """Execute a single crawl + filter cycle.
+        """Execute one crawl + two-stage filter cycle.
 
-        Returns summary stats.
+        Returns summary stats. Step 3 (profile crawl) only runs for authors
+        that passed the early filter. The final filter only runs on authors
+        that have profile_crawled_at set (i.e. Step 3 has actually completed).
         """
-        # Step 1: Crawl
-        logger.info("=== Crawler Service: Step 1 - Crawling ===")
+        # Step 1+2: Crawl posts/comments
+        logger.info("=== Crawler Service: Step 1+2 — Crawling posts/comments ===")
         crawl_result = await self.crawler.run_full_pipeline(
             include_profiles=settings.crawl_include_profiles,
         )
         logger.info("Crawl results: %s", crawl_result)
 
-        # Step 2: Shared filtering (user-independent)
-        logger.info("=== Crawler Service: Step 2 - Shared Filtering ===")
-        filtered = self.run_shared_filter()
+        # Stage 1 (early): drop matchmakers before they cost a profile request
+        logger.info("=== Crawler Service: Stage 1 — Early filter ===")
+        early_filtered = self.run_shared_filter(final=False)
 
-        # (Future: Step 3 - LLM screening for edge cases)
+        # Step 3 (profile crawl) is owned by CrawlRunner via include_profiles.
+        # When that's wired in (client.py rewrite in flight), it should set
+        # profile_crawled_at via db.mark_profile_crawled() per author.
+
+        # Stage 2 (final): re-evaluate authors whose profile is now available
+        logger.info("=== Crawler Service: Stage 2 — Final filter ===")
+        final_filtered = self.run_shared_filter(final=True)
 
         result = {
             **crawl_result,
-            "filtered_out": filtered,
+            "filtered_early": early_filtered,
+            "filtered_final": final_filtered,
         }
         logger.info("Crawler service cycle complete: %s", result)
         return result
 
-    def run_shared_filter(self) -> int:
-        """Apply shared filters to all unfiltered authors.
+    def run_shared_filter(self, final: bool = False) -> int:
+        """Apply Rule A + Rule B (and §2 min-quality if final=True).
 
-        This runs the keyword/heuristic checks that don't depend on
-        any user's profile. Filtered authors are marked in the DB
-        so the matching service skips them.
+        Args:
+            final: True after Step 3. Restricts the candidate set to
+                authors with `profile_crawled_at` set, and enforces the
+                §2 minimum-data bar in addition to the matchmaker rules.
 
-        Returns count of authors filtered out.
+        Returns count of authors newly filtered out in this pass.
         """
-        authors = self.db.get_unfiltered_authors(limit=500)
+        authors = self._candidates_for(final=final)
         filtered_count = 0
 
         for author in authors:
-            # Get the author's posts for inactive check
             posts = self.db.get_author_posts(author["id"])
-
-            keep, reason = self.shared_filter.evaluate(author, posts=posts)
+            keep, reason = self.shared_filter.evaluate(
+                author, posts=posts, final=final
+            )
             if not keep:
                 self.db.update_author_scores(
                     author["id"],
                     is_filtered_out=True,
                     filter_reason=reason,
+                    crawl_state="filtered_out",
                 )
                 filtered_count += 1
                 logger.debug("Filtered out %s: %s", author.get("nickname"), reason)
-            else:
-                # Mark as passed shared filter (is_real_person=None → placeholder 0.5)
-                # A proper value will be set by AI scoring later, but this marks
-                # the author as "shared-filter-passed" so they don't get re-processed.
+            elif final:
+                # Survived final check — promote to 'kept'.
                 self.db.update_author_scores(
                     author["id"],
-                    is_real_person=0.5,  # Placeholder: passed rules, not yet AI-scored
+                    is_real_person=0.5,  # placeholder; AI scoring happens later
+                    crawl_state="kept",
                 )
+            # else: passed early filter but stays pending_profile — don't
+            # set is_real_person yet (re-evaluated after Step 3).
 
+        stage = "final" if final else "early"
         logger.info(
-            "Shared filter: %d/%d authors filtered out", filtered_count, len(authors)
+            "Shared filter (%s): %d/%d authors filtered out",
+            stage, filtered_count, len(authors),
         )
         return filtered_count
+
+    def _candidates_for(self, final: bool) -> list[dict]:
+        """Pick which authors to evaluate at each stage."""
+        with self.db._conn() as c:
+            if final:
+                # Step 3 已完成且仍处于 pending_profile —— 准备做最终判定
+                rows = c.execute(
+                    """SELECT * FROM authors
+                       WHERE crawl_state='pending_profile'
+                         AND profile_crawled_at IS NOT NULL
+                       LIMIT 500"""
+                ).fetchall()
+            else:
+                # 还没被早期筛查命中过的 pending_profile 作者
+                rows = c.execute(
+                    """SELECT * FROM authors
+                       WHERE crawl_state='pending_profile'
+                         AND is_filtered_out=0
+                       LIMIT 500"""
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     async def run_forever(self, interval_hours: int | None = None) -> None:
         """Run the crawl+filter cycle continuously.

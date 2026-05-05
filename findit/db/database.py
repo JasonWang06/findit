@@ -37,8 +37,10 @@ CREATE TABLE IF NOT EXISTS authors (
     age_tag TEXT,
     notes_summary TEXT DEFAULT '[]',       -- JSON array
     is_real_person REAL,                   -- 0.0 - 1.0 confidence
-    is_filtered_out INTEGER DEFAULT 0,     -- 1 if ruled out by filters
+    is_filtered_out INTEGER DEFAULT 0,     -- 1 if ruled out by filters (legacy boolean)
     filter_reason TEXT,
+    crawl_state TEXT DEFAULT 'pending_profile',  -- pending_profile | kept | filtered_out (DATA_SPEC.md §2)
+    profile_crawled_at TEXT,                     -- Step 3 完成时间; NULL 表示主页未爬
     updated_at TEXT
 );
 
@@ -162,6 +164,25 @@ class Database:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQL)
+            self._migrate_in_place(conn)
+
+    def _migrate_in_place(self, conn) -> None:
+        """Idempotent ALTER TABLE migrations for existing DBs.
+
+        SQLite has no ADD COLUMN IF NOT EXISTS, so we check via PRAGMA.
+        """
+        existing = {
+            r["name"] for r in conn.execute("PRAGMA table_info(authors)").fetchall()
+        }
+        if "crawl_state" not in existing:
+            conn.execute(
+                "ALTER TABLE authors ADD COLUMN crawl_state TEXT "
+                "DEFAULT 'pending_profile'"
+            )
+        if "profile_crawled_at" not in existing:
+            conn.execute(
+                "ALTER TABLE authors ADD COLUMN profile_crawled_at TEXT"
+            )
 
     # ── Posts ────────────────────────────────────────────────────────────
 
@@ -492,13 +513,27 @@ class Database:
     def update_author_scores(
         self, author_id: str, is_real_person: float | None = None,
         is_filtered_out: bool = False, filter_reason: str | None = None,
+        crawl_state: str | None = None,
     ) -> None:
+        # Derive crawl_state from is_filtered_out if not explicitly passed,
+        # so existing callers keep working without changes.
+        if crawl_state is None:
+            crawl_state = "filtered_out" if is_filtered_out else "kept"
         with self._conn() as conn:
             conn.execute(
                 """UPDATE authors SET is_real_person=?, is_filtered_out=?,
-                   filter_reason=?, updated_at=? WHERE id=?""",
+                   filter_reason=?, crawl_state=?, updated_at=? WHERE id=?""",
                 (is_real_person, int(is_filtered_out), filter_reason,
-                 datetime.now().isoformat(), author_id),
+                 crawl_state, datetime.now().isoformat(), author_id),
+            )
+
+    def mark_profile_crawled(self, author_id: str) -> None:
+        """Stamp Step 3 completion time. Call this after the profile crawler
+        successfully fetches /user/profile/<author_id>."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE authors SET profile_crawled_at=?, updated_at=? WHERE id=?",
+                (datetime.now().isoformat(), datetime.now().isoformat(), author_id),
             )
 
     def get_author(self, author_id: str) -> dict | None:

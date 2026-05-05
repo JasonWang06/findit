@@ -1,229 +1,169 @@
-"""Tests for rule-based filtering (SharedFilter + UserFilter)."""
+"""Tests for rule-based filtering — only Rule A (红娘) and Rule B (代发).
+
+See `docs/DATA_SPEC.md` §3 for the rule definitions.
+"""
 
 from findit.ai.filter_rules import SharedFilter, UserFilter, RuleFilter
 
 
-class TestSharedFilter:
-    """Tests for user-independent shared filtering."""
+class TestSharedFilterRuleA:
+    """Rule A: '红娘' anywhere in nickname / bio / post.content / notes_summary."""
 
     def setup_method(self):
         self.f = SharedFilter()
 
-    # ── Matchmaker detection ────────────────────────────────────────────
-
-    def test_filters_matchmaker_keyword_in_nickname(self):
-        author = {
-            "nickname": "深圳红娘小王",
-            "bio": "帮你找到真爱",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
+    def test_filters_红娘_in_nickname(self):
+        author = {"nickname": "深圳红娘小王", "bio": ""}
         keep, reason = self.f.evaluate(author)
         assert keep is False
-        assert "matchmaker_keyword" in reason
+        assert reason == "matchmaker_keyword"
 
-    def test_filters_matchmaker_keyword_in_bio(self):
-        author = {
-            "nickname": "小王",
-            "bio": "专业婚介服务，十年经验",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
+    def test_filters_红娘_in_bio(self):
+        author = {"nickname": "小王", "bio": "我是红娘 帮你找对象"}
         keep, reason = self.f.evaluate(author)
         assert keep is False
-        assert "matchmaker_keyword" in reason
+        assert reason == "matchmaker_keyword"
 
-    def test_filters_matchmaker_service_keywords(self):
-        """Test new service-related keywords like 加v, 免费介绍."""
-        for keyword in ["加v咨询", "免费介绍对象", "进群了解"]:
-            author = {
-                "nickname": "小花",
-                "bio": keyword,
-                "ip_location": "深圳",
-                "notes_summary": [{"title": "日常"}],
-            }
-            keep, reason = self.f.evaluate(author)
-            assert keep is False, f"Should filter '{keyword}'"
-            assert "matchmaker_keyword" in reason
-
-    def test_filters_high_dating_ratio(self):
-        """Notes where >60% are dating posts → matchmaker."""
-        author = {
-            "nickname": "小红",
-            "bio": "帮你找到真爱",
-            "ip_location": "深圳",
-            "followers": 5000,
-            "following": 100,
-            "notes_summary": [
-                {"title": "95年找对象"},
-                {"title": "征婚启事"},
-                {"title": "找男友"},
-                {"title": "相亲"},
-                {"title": "单身交友"},
-                {"title": "日常穿搭"},
-            ],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "dating_ratio" in reason
-
-    def test_filters_multiple_ages_in_titles(self):
-        """Different birth years in note titles → posting for multiple people."""
-        author = {
-            "nickname": "小花",
-            "bio": "爱生活",
-            "ip_location": "深圳",
-            "notes_summary": [
-                {"title": "95年深圳找对象"},
-                {"title": "98年女生征男友"},
-                {"title": "00年单身"},
-                {"title": "日常分享"},
-            ],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "multiple_ages" in reason
-
-    def test_keeps_single_age_in_titles(self):
-        """Same birth year repeated is fine (real person)."""
-        author = {
-            "nickname": "小花",
-            "bio": "爱生活",
-            "ip_location": "深圳",
-            "notes_summary": [
-                {"title": "95年找对象"},
-                {"title": "95年女生日常"},
-                {"title": "周末去哪玩"},
-            ],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is True
-
-    # ── Marketing detection ─────────────────────────────────────────────
-
-    def test_filters_marketing_keyword(self):
-        author = {
-            "nickname": "品牌合作找我",
-            "bio": "全网推广",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "marketing" in reason
-
-    def test_filters_high_followers_low_content(self):
-        author = {
-            "nickname": "小美",
-            "bio": "爱美食",
-            "ip_location": "深圳",
-            "followers": 100000,
-            "notes_summary": [{"title": "唯一一篇"}],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "marketing" in reason
-
-    # ── Empty account ───────────────────────────────────────────────────
-
-    def test_filters_empty_account(self):
-        author = {
-            "nickname": "user123",
-            "bio": "",
-            "ip_location": "深圳",
-            "following": 0,
-            "notes_summary": [],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "empty" in reason
-
-    # ── Inactive detection ──────────────────────────────────────────────
-
-    def test_filters_inactive_old_posts(self):
-        author = {
-            "nickname": "小花",
-            "bio": "爱生活",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
-        posts = [{"created_at": "2024-01-01T00:00:00"}]
+    def test_filters_红娘_in_post_content(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "城市红娘平台 加微信"}]
         keep, reason = self.f.evaluate(author, posts=posts)
         assert keep is False
-        assert "inactive" in reason
+        assert reason == "matchmaker_keyword"
 
-    def test_keeps_recent_posts(self):
-        from datetime import datetime
+    def test_filters_红娘_in_notes_summary_title(self):
         author = {
             "nickname": "小花",
-            "bio": "爱生活",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
-        posts = [{"created_at": datetime.now().isoformat()}]
-        keep, reason = self.f.evaluate(author, posts=posts)
-        assert keep is True
-
-    # ── Suspicious patterns ─────────────────────────────────────────────
-
-    def test_filters_default_name_with_dating_posts(self):
-        author = {
-            "nickname": "小红书用户ABC123",
             "bio": "",
-            "ip_location": "深圳",
-            "notes_summary": [
-                {"title": "找对象"},
-                {"title": "征婚"},
-                {"title": "美食分享"},
-            ],
+            "notes_summary": [{"title": "本红娘成功案例", "content": ""}],
         }
         keep, reason = self.f.evaluate(author)
         assert keep is False
-        assert "default_name" in reason
+        assert reason == "matchmaker_keyword"
 
-    def test_filters_contact_in_bio(self):
-        author = {
-            "nickname": "小花",
-            "bio": "v：match123456",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "contact_in_bio" in reason
-
-    def test_filters_phone_in_bio(self):
-        author = {
-            "nickname": "小花",
-            "bio": "联系我13800138000",
-            "ip_location": "深圳",
-            "notes_summary": [{"title": "日常"}],
-        }
-        keep, reason = self.f.evaluate(author)
-        assert keep is False
-        assert "contact_in_bio" in reason
-
-    # ── Normal profiles pass ────────────────────────────────────────────
-
-    def test_keeps_normal_profile(self):
+    def test_keeps_no_红娘_anywhere(self):
         author = {
             "nickname": "小花",
             "bio": "爱旅行爱美食",
-            "ip_location": "深圳",
-            "followers": 500,
-            "following": 200,
-            "notes_summary": [
-                {"title": "周末去哪玩"},
-                {"title": "今天做了好吃的"},
-            ],
+            "notes_summary": [{"title": "周末去哪玩"}],
         }
-        keep, reason = self.f.evaluate(author)
+        posts = [{"content": "今天天气真好,去吃了火锅"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is True
+        assert reason is None
+
+    def test_no_longer_filters_old_keywords(self):
+        """Old keywords (婚介/牵线/加微/进群) are no longer in scope per spec."""
+        for word in ["婚介服务", "牵线搭桥", "加微信咨询", "进群了解"]:
+            author = {"nickname": "小花", "bio": word}
+            keep, _ = self.f.evaluate(author)
+            assert keep is True, f"{word!r} should pass — only 红娘 triggers Rule A"
+
+
+class TestSharedFilterRuleB:
+    """Rule B: 代发-style proxy-post phrases in post.content."""
+
+    def setup_method(self):
+        self.f = SharedFilter()
+
+    def test_filters_代发_keyword(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "代发,本人28岁深圳找对象"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_filters_代闺蜜发_via_regex(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "代闺蜜发的征婚帖,28岁医生"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_filters_帮表姐发(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "帮表姐发,98年女生"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_keeps_本人同意_alone(self):
+        """'已获本人同意' 单独不算 — 防止法律披露语境误伤。"""
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "其本人同意公开,作为法院证据"}]
+        keep, _ = self.f.evaluate(author, posts=posts)
+        assert keep is True
+
+    def test_filters_本人同意_with_explicit_proxy(self):
+        """'已获本人同意' + 显式代发 → 仍然命中(通过显式词触发)。"""
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "代闺蜜发,已获本人同意,28岁医生"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_filters_本人不在小红书(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "本人不在小红书,有意者私信"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_filters_非本人(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "非本人,代朋友找对象"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
+        assert keep is False
+        assert reason == "matchmaker_proxy_post"
+
+    def test_keeps_normal_self_post(self):
+        author = {"nickname": "小花", "bio": ""}
+        posts = [{"content": "我28岁深圳工程师 想找个聊得来的"}]
+        keep, reason = self.f.evaluate(author, posts=posts)
         assert keep is True
         assert reason is None
 
 
+class TestSharedFilterMinQuality:
+    """§2 minimum-data bar — only enforced when final=True (post-Step 3)."""
+
+    def setup_method(self):
+        self.f = SharedFilter()
+
+    def test_skipped_when_not_final(self):
+        """Pre-Step 3: missing ip_location should NOT filter."""
+        author = {"nickname": "小花", "bio": "", "ip_location": ""}
+        keep, _ = self.f.evaluate(author, posts=[], final=False)
+        assert keep is True
+
+    def test_fails_without_ip_location_when_final(self):
+        author = {"nickname": "小花", "bio": "爱生活", "ip_location": ""}
+        posts = [{"content": "今天去爬山真开心"}]
+        keep, reason = self.f.evaluate(author, posts=posts, final=True)
+        assert keep is False
+        assert reason == "low_quality_content"
+
+    def test_fails_with_no_content_when_final(self):
+        author = {"nickname": "小花", "bio": "", "ip_location": "深圳"}
+        posts = [{"content": "ddd"}]  # too short
+        keep, reason = self.f.evaluate(author, posts=posts, final=True)
+        assert keep is False
+        assert reason == "low_quality_content"
+
+    def test_passes_with_ip_location_and_bio(self):
+        author = {"nickname": "小花", "bio": "爱生活", "ip_location": "深圳"}
+        keep, _ = self.f.evaluate(author, posts=[], final=True)
+        assert keep is True
+
+    def test_passes_with_ip_location_and_long_post(self):
+        author = {"nickname": "小花", "bio": "", "ip_location": "深圳"}
+        posts = [{"content": "我是98年女生,在深圳工作,想找个稳定的对象"}]
+        keep, _ = self.f.evaluate(author, posts=posts, final=True)
+        assert keep is True
+
+
 class TestUserFilter:
-    """Tests for per-user filtering."""
+    """Per-user location filter (unchanged from previous behavior)."""
 
     def test_filters_wrong_city(self):
         f = UserFilter(user_city="深圳", allow_remote=False)
@@ -235,40 +175,34 @@ class TestUserFilter:
     def test_allows_same_city(self):
         f = UserFilter(user_city="深圳")
         author = {"ip_location": "广东深圳"}
-        keep, reason = f.evaluate(author)
+        keep, _ = f.evaluate(author)
         assert keep is True
 
     def test_allows_remote_when_configured(self):
         f = UserFilter(user_city="深圳", allow_remote=True)
         author = {"ip_location": "北京"}
-        keep, reason = f.evaluate(author)
+        keep, _ = f.evaluate(author)
         assert keep is True
 
     def test_allows_unknown_location(self):
         f = UserFilter(user_city="深圳")
         author = {"ip_location": ""}
-        keep, reason = f.evaluate(author)
+        keep, _ = f.evaluate(author)
         assert keep is True
 
 
 class TestRuleFilterCompat:
-    """Test backward-compatible RuleFilter wrapper."""
+    """Legacy wrapper: SharedFilter + UserFilter."""
 
-    def test_combines_shared_and_user_filters(self):
+    def test_filters_by_matchmaker_keyword(self):
         f = RuleFilter(user_city="深圳")
-        # Should be filtered by shared filter (matchmaker keyword)
-        author = {"nickname": "红娘小王", "bio": "", "notes_summary": [{"title": "a"}]}
-        keep, reason = f.evaluate(author)
+        author = {"nickname": "红娘小王", "bio": "", "ip_location": "深圳"}
+        keep, _ = f.evaluate(author)
         assert keep is False
 
     def test_filters_by_location(self):
         f = RuleFilter(user_city="深圳", allow_remote=False)
-        author = {
-            "nickname": "小花", "bio": "爱生活",
-            "ip_location": "北京",
-            "notes_summary": [{"title": "日常"}],
-            "following": 10,
-        }
+        author = {"nickname": "小花", "bio": "爱生活", "ip_location": "北京"}
         keep, reason = f.evaluate(author)
         assert keep is False
         assert "location" in reason

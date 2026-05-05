@@ -129,16 +129,19 @@ class CrawlRunner:
         return found
 
     async def step3_scrape_profiles(self, limit: int = 50) -> int:
-        """Scrape full profiles for authors (requires login — use sparingly).
+        """Scrape user profiles for authors still in pending_profile state.
 
-        This step is OPTIONAL. The search + comments pipeline works
-        without it. Only enable when you have a stable cookie setup.
+        Per `docs/DATA_SPEC.md` §1.3: only authors that survived early
+        filtering get a profile crawl. After a successful fetch we stamp
+        `profile_crawled_at` so `crawler_service.run_shared_filter(final=True)`
+        knows they're ready for final evaluation.
         """
         author_ids = self.db.get_unscraped_author_ids(limit=limit)
         with self.db._conn() as conn:
             rows = conn.execute(
                 """SELECT id FROM authors
-                   WHERE bio IS NULL AND is_filtered_out = 0
+                   WHERE crawl_state='pending_profile'
+                     AND profile_crawled_at IS NULL
                    LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -156,6 +159,7 @@ class CrawlRunner:
             profile["notes_summary"] = notes[:10]
 
             self.db.upsert_author(profile)
+            self.db.mark_profile_crawled(uid)
             scraped += 1
 
         logger.info("Step 3 complete: scraped %d profiles", scraped)
