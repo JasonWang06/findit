@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     playwright_page_timeout: int = 30000
     playwright_sign_timeout: int = 15000
 
+    # Persistent Chromium profile dir (used by BrowserSession; cookies/session
+    # live here so a single QR-login persists across runs).
+    browser_profile_dir: str = "data/chromium_profile"
+    browser_headless: bool = False  # headed = closer fingerprint match to real users
+
     # Crawler service
     crawler_continuous: bool = True  # True = run_forever, False = run_once
     crawl_include_profiles: bool = False  # profile scraping needs login, off by default

@@ -1,146 +1,362 @@
-"""Xiaohongshu API client using the xhs library with Playwright-based signing.
+"""Xiaohongshu client driven by a persistent logged-in browser, using
+UI-navigation + DOM scraping (NOT page.evaluate(fetch))."""
 
-Uses the xhs library (ReaJason/xhs) for API methods, but replaces its
-outdated pure-Python signing with real browser-based signing via Playwright.
-This calls window._webmsxyw() in a headless Chromium to generate valid
-x-s, x-t, x-s-common headers that pass XHS's server-side verification.
-"""
+# Why DOM-scraping instead of fetch:
+#   Even from inside the logged-in page, calling fetch('/api/.../search/notes')
+#   triggers risk-control (`code:300011 当前账号存在异常`). Yet the very same
+#   account loads results fine when the user navigates to /search_result?...
+#   manually. We mimic that human path: page.goto → wait → read .note-item
+#   cards from the DOM. Comments are read the same way after navigating to
+#   /explore/<id>.
+#
+# Why a persistent context with one page:
+#   The user QR-scans into the browser once; cookies, localStorage, and
+#   browser fingerprint live in a persistent user_data_dir. From XHS's
+#   risk-control view, every request looks like "human opened a tab,
+#   browsed a search page, clicked into a note" — because that's literally
+#   what's happening.
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import random
+import re
+import time
+from pathlib import Path
 from typing import Any
 
-from xhs import XhsClient as _XhsClient
-from xhs.exception import DataFetchError, IPBlockError, NeedVerifyError, SignError
+from playwright.async_api import Page, async_playwright
 
 from findit.config import settings
-from findit.crawler.sign import USER_AGENT, PlaywrightSigner
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE = (IPBlockError, NeedVerifyError, SignError, DataFetchError, TimeoutError, OSError)
+WWW_HOST = "https://www.xiaohongshu.com"
+EDITH_HOST = "https://edith.xiaohongshu.com"
 
-# Common search keywords for dating-related content
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 SEARCH_KEYWORDS = [
     "找对象", "找男友", "找搭子", "蹲boyfriend", "脱单",
     "相亲", "CPDD", "征男友", "找另一半", "单身交友",
 ]
 
-# Keywords/phrases that signal dating intent in comments.
-# Using longer phrases instead of single characters like "找" or "求"
-# to reduce false positives from non-dating comments.
 COMMENT_DATING_KEYWORDS = [
-    # Explicit dating-seeking phrases
     "蹲一个", "蹲男友", "蹲对象", "蹲男朋友", "蹲女友", "蹲女朋友",
     "找对象", "找男友", "找男朋友", "找女友", "找女朋友", "找另一半",
     "求脱单", "求认识", "求交友",
-    # Status keywords (still specific enough)
     "单身", "脱单", "交友", "同城",
-    # Self-intro style comments
     "坐标", "互相了解",
-    # Code words / abbreviations
     "私聊", "dd", "cpdd", "CPDD",
-    # Condition-listing comments (people posting their stats)
     "身高1", "本科", "硕士", "研究生",
 ]
 
 
+# JS to scrape rendered search-result cards.
+_SCRAPE_SEARCH_JS = r"""
+() => {
+    const out = [];
+    document.querySelectorAll('section.note-item').forEach(card => {
+        const cover = card.querySelector('a.cover');
+        const hidden = card.querySelector('a[href^="/explore/"]');
+        let id = '', xsec = '';
+        if (hidden) {
+            const m = hidden.getAttribute('href').match(/\/explore\/([0-9a-f]+)/);
+            if (m) id = m[1];
+        }
+        if (!id && cover) {
+            const m = cover.getAttribute('href').match(/\/(?:search_result|explore)\/([0-9a-f]+)/);
+            if (m) id = m[1];
+        }
+        if (cover) {
+            const m = cover.getAttribute('href').match(/xsec_token=([^&]+)/);
+            if (m) xsec = decodeURIComponent(m[1]);
+        }
+        // Card structure on the search-result page:
+        //   <section.note-item>
+        //     ... cover + img ...
+        //     <div class="footer">
+        //       <a class="title"><span>...title...</span></a>
+        //       <div class="author-wrapper">
+        //         <a class="author" href="/user/profile/<id>?...">
+        //            <img.../><span class="name">作者名</span>
+        //         </a>
+        //         <span class="like-wrapper"><span class="count">42</span></span>
+        //       </div>
+        //     </div>
+        //   </section>
+        const titleEl = card.querySelector('a.title') || card.querySelector('.title');
+        const authorAnchor = card.querySelector('.author-wrapper a.author')
+                          || card.querySelector('a[href*="/user/profile/"]');
+        const nameEl = card.querySelector('.author-wrapper .name')
+                    || (authorAnchor && authorAnchor.querySelector('.name'))
+                    || card.querySelector('.name');
+        const likeEl = card.querySelector('.like-wrapper .count')
+                    || card.querySelector('.count');
+        const img = card.querySelector('img');
+
+        let user_id = '';
+        if (authorAnchor) {
+            user_id = authorAnchor.getAttribute('data-user-id') || '';
+            if (!user_id) {
+                const m = (authorAnchor.getAttribute('href') || '')
+                    .match(/\/user\/profile\/([0-9a-f]+)/);
+                if (m) user_id = m[1];
+            }
+        }
+        out.push({
+            id,
+            xsec_token: xsec,
+            title: titleEl ? titleEl.textContent.trim() : '',
+            author_user_id: user_id,
+            author_nickname: nameEl ? nameEl.textContent.trim() : '',
+            likes_text: likeEl ? likeEl.textContent.trim() : '0',
+            cover_url: img ? (img.getAttribute('src') || '') : '',
+        });
+    });
+    return out;
+}
+"""
+
+# JS to scrape comments on a /explore/<id> page after it's loaded.
+_SCRAPE_COMMENTS_JS = r"""
+() => {
+    const out = [];
+    document.querySelectorAll('.comment-item').forEach(item => {
+        const id = (item.id || '').replace(/^comment-/, '');
+        const authorA = item.querySelector('.author a.name')
+                     || item.querySelector('.author-wrapper a.name')
+                     || item.querySelector('a.name');
+        const contentEl = item.querySelector('.content .note-text')
+                       || item.querySelector('.note-text')
+                       || item.querySelector('.content');
+        const ipEl = item.querySelector('.location')
+                  || item.querySelector('.info .location');
+        const likeEl = item.querySelector('.like .count')
+                    || item.querySelector('.interaction .count');
+        const tagEl = item.querySelector('.tag');
+
+        let user_id = '';
+        if (authorA) {
+            user_id = authorA.getAttribute('data-user-id') || '';
+            if (!user_id) {
+                const m = (authorA.getAttribute('href') || '')
+                    .match(/\/user\/profile\/([0-9a-f]+)/);
+                if (m) user_id = m[1];
+            }
+        }
+        const avatar = item.querySelector('.avatar img');
+        out.push({
+            comment_id: id,
+            user_id,
+            nickname: authorA ? authorA.textContent.trim() : '',
+            avatar: avatar ? (avatar.getAttribute('src') || '') : '',
+            content: contentEl ? contentEl.textContent.trim() : '',
+            ip_location: ipEl ? ipEl.textContent.trim() : '',
+            like_count_text: likeEl ? likeEl.textContent.trim() : '0',
+            is_author: !!(tagEl && tagEl.textContent.trim() === '作者'),
+        });
+    });
+    return out;
+}
+"""
+
+
+_LOGIN_PROBE_JS = r"""
+() => {
+    // any visible login modal/qr → NOT logged in
+    const loginSelectors = [
+        '.login-container', '.login-mask', '.qrcode-img',
+        '.login-pannel', '.login-panel',
+        'div[class*="login"][class*="modal"]', 'div[class*="qrcode"]',
+    ];
+    for (const sel of loginSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.offsetParent !== null) return {logged_in: false, why: 'login_modal'};
+    }
+    // any visible "登录" button → NOT logged in
+    const allText = document.querySelectorAll('button, a, span, div');
+    for (const el of allText) {
+        if (!el.offsetParent) continue;
+        const t = (el.textContent || '').trim();
+        if (t === '登录' || t === 'Login' || t === 'Sign in' || t === '登录注册') {
+            // but make sure it's a small button, not a paragraph with the word
+            if (t.length <= 6) return {logged_in: false, why: 'login_button'};
+        }
+    }
+    // require at least one logged-in marker
+    const okSelectors = [
+        '.side-bar-component .user .name',
+        '.user-info .name',
+        'div[class*="user"] img[class*="avatar"]',
+        '.reds-avatar img',
+    ];
+    const found = okSelectors.find(sel => document.querySelector(sel));
+    if (found) return {logged_in: true, why: 'marker:' + found};
+    return {logged_in: false, why: 'no_marker'};
+}
+"""
+
+
 class XHSClient:
-    """Async wrapper around the xhs library's XhsClient.
+    """Browser-driven XHS client.
 
-    Uses Playwright-based signing for valid request headers.
-    The xhs library is synchronous, so all API calls are wrapped
-    with asyncio.to_thread() to avoid blocking the event loop.
+    Owns a persistent headed Chromium session. The first time it's used,
+    the user must QR-scan to log in. After that, the profile dir holds the
+    cookies and localStorage so subsequent runs skip the login step.
 
-    Includes retry with exponential backoff for transient failures
-    and per-request timeouts.
-
-    Must call ``await client.setup()`` before use and
-    ``await client.close()`` when done.
+    Public methods preserve the previous XHSClient interface so the
+    runner / services don't need changes.
     """
 
-    WEB_URL = "https://www.xiaohongshu.com"
+    WEB_URL = WWW_HOST
 
     def __init__(self, cookie: str | None = None):
-        self.cookie = cookie or settings.xhs_cookie
+        # cookie param kept for backwards compatibility but unused —
+        # cookies live in the persistent profile dir.
+        del cookie
         self._delay_min = settings.crawl_request_delay_min
         self._delay_max = settings.crawl_request_delay_max
         self._max_retries = settings.crawl_max_retries
         self._retry_base = settings.crawl_retry_base_delay
-        self._request_timeout = settings.crawl_request_timeout
 
-        cookie_dict = _cookie_str_to_dict(self.cookie)
-        self._signer = PlaywrightSigner(
-            a1=cookie_dict.get("a1", ""),
-            web_id=cookie_dict.get("webId", ""),
-        )
-        self._client: _XhsClient | None = None
+        self._playwright = None
+        self._context = None
+        self._page: Page | None = None
+        self._started = False
+        self._lock = asyncio.Lock()
+
+    # ── Lifecycle ───────────────────────────────────────────────────────
 
     async def setup(self) -> None:
-        await self._signer.start()
-        self._client = _XhsClient(
-            cookie=self.cookie,
-            sign=self._signer.sign_sync,
+        if self._started:
+            return
+        profile = Path(settings.browser_profile_dir).resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        logger.info("Launching persistent Chromium (profile=%s)", profile)
+
+        self._playwright = await async_playwright().start()
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            headless=settings.browser_headless,
             user_agent=USER_AGENT,
+            args=["--disable-blink-features=AutomationControlled"],
+            viewport={"width": 1280, "height": 800},
+        )
+        # reuse first page or open new one
+        pages = self._context.pages
+        self._page = pages[0] if pages else await self._context.new_page()
+        await self._page.goto(WWW_HOST, wait_until="domcontentloaded",
+                              timeout=settings.playwright_page_timeout)
+        await self._page.wait_for_function(
+            "() => typeof window._webmsxyw === 'function'",
+            timeout=settings.playwright_sign_timeout,
         )
 
-    async def close(self) -> None:
-        await self._signer.close()
+        if not await self._is_logged_in():
+            await self._wait_for_login()
 
-    def _ensure_client(self) -> _XhsClient:
-        if self._client is None:
-            raise RuntimeError("XHSClient not initialized — call await client.setup() first")
-        return self._client
+        self._started = True
+        logger.info("XHSClient ready (logged in, page on %s)", self._page.url)
+
+    async def close(self) -> None:
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        self._page = None
+        self._started = False
+
+    async def _is_logged_in(self) -> bool:
+        """Return True only when DOM signal AND a real web_session cookie exist."""
+        if self._page is None or self._context is None:
+            return False
+        try:
+            res = await self._page.evaluate(_LOGIN_PROBE_JS)
+        except Exception:
+            return False
+        if not isinstance(res, dict) or not res.get("logged_in"):
+            return False
+        # also require a non-trivial web_session cookie
+        try:
+            cookies = await self._context.cookies()
+        except Exception:
+            return False
+        for c in cookies:
+            if c.get("name") == "web_session" and len(c.get("value", "")) >= 20:
+                return True
+        return False
+
+    async def _wait_for_login(self, timeout_sec: int = 300) -> None:
+        assert self._page is not None
+        print("\n" + "=" * 60)
+        print("👉 请在打开的 Chrome 窗口里用 XHS APP 扫码登录")
+        print("   登录后脚本会自动检测并继续，无需手动关窗口。")
+        print("=" * 60 + "\n")
+        try:
+            await self._page.evaluate("""
+                const b = document.createElement('div');
+                b.id = '__findit_banner';
+                b.textContent = '🔄 等你扫码登录…完成后脚本自动继续';
+                b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#e60023;color:#fff;font:bold 16px/36px sans-serif;text-align:center;padding:6px;box-shadow:0 2px 6px rgba(0,0,0,0.3)';
+                document.body.appendChild(b);
+            """)
+        except Exception:
+            pass
+
+        start = time.time()
+        stable = 0
+        while time.time() - start < timeout_sec:
+            if await self._is_logged_in():
+                stable += 1
+                if stable >= 4:
+                    print("✅ 登录确认")
+                    try:
+                        await self._page.evaluate(
+                            "const b = document.getElementById('__findit_banner'); if (b) b.remove();"
+                        )
+                    except Exception:
+                        pass
+                    return
+            else:
+                stable = 0
+            await asyncio.sleep(1)
+        raise RuntimeError(f"Login timeout after {timeout_sec}s")
+
+    # ── Throttle / retry ────────────────────────────────────────────────
 
     async def _sleep(self) -> None:
-        delay = random.uniform(self._delay_min, self._delay_max)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(random.uniform(self._delay_min, self._delay_max))
 
-    async def _call_with_retry(self, fn, *args, **kwargs) -> Any:
-        """Call a sync xhs function with timeout, retry, and exponential backoff."""
-        last_exc = None
-        for attempt in range(self._max_retries + 1):
-            if attempt > 0:
-                backoff = self._retry_base * (2 ** (attempt - 1)) + random.uniform(0, 2)
-                logger.warning("Retry %d/%d in %.1fs...", attempt, self._max_retries, backoff)
-                await asyncio.sleep(backoff)
+    async def _navigate(self, url: str, *, settle_sec: float = 4.0) -> None:
+        """Navigate the single shared page and let it settle."""
+        assert self._page is not None
+        async with self._lock:
+            await self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=settings.playwright_page_timeout,
+            )
+            await asyncio.sleep(settle_sec)
 
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(fn, *args, **kwargs),
-                    timeout=self._request_timeout,
-                )
-            except NeedVerifyError:
-                logger.warning("CAPTCHA triggered, backing off longer...")
-                await asyncio.sleep(30 + random.uniform(0, 30))
-                last_exc = NeedVerifyError("captcha")
-            except IPBlockError as e:
-                logger.warning("IP blocked: %s", e)
-                last_exc = e
-            except SignError as e:
-                logger.warning("Sign error (attempt %d): %s", attempt + 1, e)
-                if self._signer._started:
-                    await self._signer.restart()
-                    self._client = _XhsClient(
-                        cookie=self.cookie,
-                        sign=self._signer.sign_sync,
-                        user_agent=USER_AGENT,
-                    )
-                last_exc = e
-            except (DataFetchError, TimeoutError, OSError) as e:
-                logger.warning("Transient error (attempt %d): %s", attempt + 1, e)
-                last_exc = e
-            except Exception as e:
-                logger.exception("Non-retryable error: %s", e)
-                raise
+    # ── Public API (matches old XHSClient) ──────────────────────────────
 
-        logger.error("All %d retries exhausted", self._max_retries + 1)
-        raise last_exc or RuntimeError("Retries exhausted")
-
-    # ── Step 1: Search posts by keyword ─────────────────────────────────
+    # cache xsec_token by note_id from the most recent search; needed when
+    # navigating to /explore/<id> for comments
+    _NOTE_XSEC: dict[str, str] = {}
 
     async def search_notes(
         self,
@@ -149,166 +365,198 @@ class XHSClient:
         page: int = 1,
         page_size: int = 20,
     ) -> list[dict[str, Any]]:
+        del sort, page_size  # not parameters on UI search URL
         await self._sleep()
+        from urllib.parse import quote
+        url = (
+            f"{WWW_HOST}/search_result?keyword={quote(keyword)}"
+            f"&source=web_search_result_notes&page={page}"
+        )
+        logger.info("search '%s' (page %d) → %s", keyword, page, url)
         try:
-            data = await self._call_with_retry(
-                self._ensure_client().get_note_by_keyword,
-                keyword,
-                page=page,
-                page_size=page_size,
-            )
-
-            items = data.get("items", [])
-            results = []
-            for item in items:
-                note_card = item.get("note_card", {})
-                user = note_card.get("user", {})
-                results.append({
-                    "id": item.get("id", ""),
-                    "title": note_card.get("title", ""),
-                    "desc": note_card.get("desc", ""),
-                    "content": (
-                        note_card.get("title", "") + "\n" + note_card.get("desc", "")
-                    ),
-                    "user_id": user.get("user_id", ""),
-                    "user_nickname": user.get("nickname", ""),
-                    "user_avatar": user.get("avatar", ""),
-                    "likes": note_card.get("interact_info", {}).get("liked_count", "0"),
-                    "image_list": [
-                        img.get("url_default", "")
-                        for img in note_card.get("image_list", [])
-                    ],
-                    "time": note_card.get("time"),
-                    "ip_location": note_card.get("ip_location", ""),
-                })
-            logger.info(
-                "Search '%s' page %d returned %d results", keyword, page, len(results)
-            )
-            return results
+            await self._navigate(url, settle_sec=5.0)
+            cards = await self._page.evaluate(_SCRAPE_SEARCH_JS)
         except Exception:
-            logger.exception("Failed to search notes for keyword '%s'", keyword)
+            logger.exception("search_notes failed for '%s'", keyword)
+            return []
+        if not isinstance(cards, list):
+            logger.warning("search returned non-list: %r", cards)
             return []
 
-    # ── Step 2: Get comments on a post ──────────────────────────────────
+        results = []
+        for c in cards:
+            if not c.get("id"):
+                continue
+            self._NOTE_XSEC[c["id"]] = c.get("xsec_token", "")
+            results.append({
+                "id": c["id"],
+                "title": c.get("title", ""),
+                "desc": "",
+                "content": c.get("title", ""),
+                "user_id": c.get("author_user_id", ""),
+                "user_nickname": c.get("author_nickname", ""),
+                "user_avatar": c.get("cover_url", ""),
+                "likes": c.get("likes_text", "0"),
+                "image_list": [c.get("cover_url", "")] if c.get("cover_url") else [],
+                "time": None,
+                "ip_location": "",
+                "xsec_token": c.get("xsec_token", ""),
+            })
+        logger.info("search '%s' page %d → %d cards (DOM)", keyword, page, len(results))
+        return results
 
     async def get_note_comments(
-        self, note_id: str, cursor: str = "", page_size: int = 20
+        self, note_id: str, cursor: str = "", page_size: int = 20,
     ) -> tuple[list[dict[str, Any]], str]:
+        del cursor, page_size  # DOM scrape gets the first page already rendered
         await self._sleep()
+        xsec = self._NOTE_XSEC.get(note_id, "")
+        url = f"{WWW_HOST}/explore/{note_id}"
+        if xsec:
+            url += f"?xsec_token={xsec}&xsec_source=pc_search"
         try:
-            data = await self._call_with_retry(
-                self._ensure_client().get_note_comments, note_id, cursor=cursor
-            )
-
-            comments_raw = data.get("comments", [])
-            next_cursor = data.get("cursor", "")
-            has_more = data.get("has_more", False)
-
-            comments = []
-            for c in comments_raw:
-                user_info = c.get("user_info", {})
-                comments.append({
-                    "comment_id": c.get("id", ""),
-                    "content": c.get("content", ""),
-                    "user_id": user_info.get("user_id", ""),
-                    "nickname": user_info.get("nickname", ""),
-                    "avatar": user_info.get("image", ""),
-                    "ip_location": c.get("ip_location", ""),
-                    "like_count": c.get("like_count", 0),
-                    "create_time": c.get("create_time"),
-                })
-            logger.info(
-                "Note %s comments: got %d, has_more=%s",
-                note_id,
-                len(comments),
-                has_more,
-            )
-            return comments, next_cursor if has_more else ""
+            await self._navigate(url, settle_sec=4.0)
+            # try to scroll the comment area into view to ensure render
+            try:
+                await self._page.evaluate(
+                    "() => { const el = document.querySelector('.comments-el')"
+                    " || document.querySelector('.comment-container');"
+                    " if (el) el.scrollIntoView(); }"
+                )
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+            comments = await self._page.evaluate(_SCRAPE_COMMENTS_JS)
         except Exception:
-            logger.exception("Failed to get comments for note %s", note_id)
+            logger.exception("get_note_comments failed for %s", note_id)
+            return [], ""
+        if not isinstance(comments, list):
             return [], ""
 
+        out = []
+        for c in comments:
+            try:
+                like = int(re.sub(r"\D", "", c.get("like_count_text", "0") or "0") or 0)
+            except Exception:
+                like = 0
+            out.append({
+                "comment_id": c.get("comment_id", ""),
+                "content": c.get("content", ""),
+                "user_id": c.get("user_id", ""),
+                "nickname": c.get("nickname", ""),
+                "avatar": c.get("avatar", ""),
+                "ip_location": c.get("ip_location", ""),
+                "like_count": like,
+                "create_time": None,
+                "is_author": c.get("is_author", False),
+            })
+        logger.info("note %s comments → %d (DOM)", note_id, len(out))
+        # DOM only shows page 1; no cursor available
+        return out, ""
+
     def filter_dating_comments(self, comments: list[dict]) -> list[dict]:
-        matches = []
+        out = []
         for c in comments:
             content_lower = c.get("content", "").lower()
             if any(kw in content_lower for kw in COMMENT_DATING_KEYWORDS):
-                matches.append(c)
-        return matches
-
-    # ── Step 3: Get user profile ────────────────────────────────────────
+                out.append(c)
+        return out
 
     async def get_user_profile(self, user_id: str) -> dict[str, Any]:
+        """Scrape /user/profile/<user_id>. Returns minimal info."""
         await self._sleep()
         try:
-            user_data = await self._call_with_retry(
-                self._ensure_client().get_user_info, user_id
-            )
-            return {
-                "id": user_id,
-                "nickname": user_data.get("basic_info", {}).get("nickname", ""),
-                "avatar_url": user_data.get("basic_info", {}).get("image", ""),
-                "ip_location": user_data.get("basic_info", {}).get("ip_location", ""),
-                "bio": user_data.get("basic_info", {}).get("desc", ""),
-                "age_tag": user_data.get("basic_info", {}).get("age", ""),
-                "followers": _safe_int(
-                    user_data.get("interactions", [{}])[0].get("count", "0")
-                    if user_data.get("interactions")
-                    else 0
-                ),
-                "following": _safe_int(
-                    user_data.get("interactions", [{}])[1].get("count", "0")
-                    if len(user_data.get("interactions", [])) > 1
-                    else 0
-                ),
-                "likes_collected": _safe_int(
-                    user_data.get("interactions", [{}])[2].get("count", "0")
-                    if len(user_data.get("interactions", [])) > 2
-                    else 0
-                ),
-            }
+            await self._navigate(f"{WWW_HOST}/user/profile/{user_id}", settle_sec=4.0)
+            data = await self._page.evaluate(r"""
+                () => {
+                    const nick = document.querySelector('.user-nickname, .user-name, .nickname');
+                    const desc = document.querySelector('.user-desc, .user-bio');
+                    const ip = document.querySelector('.ip-info, .location');
+                    const avatar = document.querySelector('.user-avatar img, .avatar img');
+                    const stats = [...document.querySelectorAll('.user-info .count, .data-info .count, .num')]
+                        .map(e => (e.textContent || '').trim());
+                    return {
+                        nickname: nick ? nick.textContent.trim() : '',
+                        bio: desc ? desc.textContent.trim() : '',
+                        ip_location: ip ? ip.textContent.trim() : '',
+                        avatar_url: avatar ? (avatar.getAttribute('src') || '') : '',
+                        stats,
+                    };
+                }
+            """)
         except Exception:
-            logger.exception("Failed to get profile for user %s", user_id)
+            logger.exception("get_user_profile failed for %s", user_id)
             return {"id": user_id}
 
+        def _safe_int(v):
+            try:
+                return int(re.sub(r"\D", "", str(v) or "0") or 0)
+            except Exception:
+                return 0
+        stats = data.get("stats") or [] if isinstance(data, dict) else []
+        return {
+            "id": user_id,
+            "nickname": data.get("nickname", "") if isinstance(data, dict) else "",
+            "avatar_url": data.get("avatar_url", "") if isinstance(data, dict) else "",
+            "ip_location": data.get("ip_location", "") if isinstance(data, dict) else "",
+            "bio": data.get("bio", "") if isinstance(data, dict) else "",
+            "age_tag": "",
+            "followers": _safe_int(stats[0]) if len(stats) > 0 else 0,
+            "following": _safe_int(stats[1]) if len(stats) > 1 else 0,
+            "likes_collected": _safe_int(stats[2]) if len(stats) > 2 else 0,
+        }
+
     async def get_user_notes(
-        self, user_id: str, cursor: str = "", page_size: int = 15
+        self, user_id: str, cursor: str = "", page_size: int = 30,
     ) -> tuple[list[dict[str, Any]], str]:
+        del cursor, page_size
         await self._sleep()
         try:
-            data = await self._call_with_retry(
-                self._ensure_client().get_user_notes, user_id, cursor=cursor
-            )
-            notes = []
-            for n in data.get("notes", []):
-                notes.append({
-                    "note_id": n.get("note_id", ""),
-                    "title": n.get("display_title", ""),
-                    "cover": n.get("cover", {}).get("url", ""),
-                    "likes": n.get("interact_info", {}).get("liked_count", "0"),
-                    "type": n.get("type", ""),
-                })
-            next_cursor = data.get("cursor", "")
-            has_more = data.get("has_more", False)
-            return notes, next_cursor if has_more else ""
+            await self._navigate(f"{WWW_HOST}/user/profile/{user_id}", settle_sec=4.0)
+            notes = await self._page.evaluate(r"""
+                () => {
+                    const out = [];
+                    document.querySelectorAll('section.note-item, .note-item').forEach(card => {
+                        const a = card.querySelector('a[href*="/explore/"]')
+                              || card.querySelector('a[href*="/profile/"]')
+                              || card.querySelector('a');
+                        let id = '';
+                        if (a) {
+                            const m = (a.getAttribute('href') || '').match(/\/explore\/([0-9a-f]+)/);
+                            if (m) id = m[1];
+                        }
+                        if (!id) return;
+                        const title = card.querySelector('.title, a.title');
+                        const likes = card.querySelector('.count, .like-wrapper .count');
+                        const img = card.querySelector('img');
+                        out.push({
+                            note_id: id,
+                            title: title ? title.textContent.trim() : '',
+                            cover: img ? (img.getAttribute('src') || '') : '',
+                            likes: likes ? likes.textContent.trim() : '0',
+                            type: card.querySelector('video') ? 'video' : 'normal',
+                        });
+                    });
+                    return out;
+                }
+            """)
         except Exception:
-            logger.exception("Failed to get notes for user %s", user_id)
+            logger.exception("get_user_notes failed for %s", user_id)
             return [], ""
+        return notes if isinstance(notes, list) else [], ""
 
     def get_note_url(self, note_id: str) -> str:
-        return f"{self.WEB_URL}/explore/{note_id}"
+        return f"{WWW_HOST}/explore/{note_id}"
 
     def get_user_url(self, user_id: str) -> str:
-        return f"{self.WEB_URL}/user/profile/{user_id}"
+        return f"{WWW_HOST}/user/profile/{user_id}"
 
 
-def _safe_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return 0
+# Re-exported for any code importing it
+__all__ = ["XHSClient", "SEARCH_KEYWORDS", "COMMENT_DATING_KEYWORDS", "USER_AGENT"]
 
 
+# Helper (used by tests, kept for compat with old client)
 def _cookie_str_to_dict(cookie_str: str) -> dict[str, str]:
     result = {}
     for part in cookie_str.split(";"):
